@@ -453,13 +453,24 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 }
 
 // GetSectionAlerts 获取断面告警
-func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int) ([]model.Alert, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, section_id, sensor_id, level, message, deformation_rate, threshold, status, triggered_at, resolved_at
+// status 传空字符串表示不过滤状态（兼容历史调用方）；
+// 传入 "active" / "resolved" 时按状态精确过滤，避免实时面板混入已解决告警。
+func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int, status string) ([]model.Alert, error) {
+	query := `SELECT id, section_id, sensor_id, level, message, deformation_rate, threshold, status, triggered_at, resolved_at
 		 FROM alerts
-		 WHERE section_id = $1
-		 ORDER BY triggered_at DESC
-		 LIMIT $2`, sectionID, limit)
+		 WHERE section_id = $1`
+	args := []interface{}{sectionID}
+	if status != "" {
+		query += ` AND status = $2`
+		args = append(args, status)
+		query += ` ORDER BY triggered_at DESC LIMIT $3`
+		args = append(args, limit)
+	} else {
+		query += ` ORDER BY triggered_at DESC LIMIT $2`
+		args = append(args, limit)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

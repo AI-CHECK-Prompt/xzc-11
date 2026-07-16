@@ -61,8 +61,15 @@ export async function getActiveAlerts(): Promise<{ data: Alert[]; total: number 
 }
 
 // 获取断面告警
-export async function getSectionAlerts(sectionId: number, limit = 50): Promise<{ data: Alert[]; total: number }> {
-  const { data } = await api.get(`/sections/${sectionId}/alerts`, { params: { limit } })
+// status 可选：'active' 仅活跃告警（实时面板用），'resolved' 仅已解决，不传则不过滤
+export async function getSectionAlerts(
+  sectionId: number,
+  limit = 50,
+  status?: 'active' | 'resolved'
+): Promise<{ data: Alert[]; total: number }> {
+  const params: any = { limit }
+  if (status) params.status = status
+  const { data } = await api.get(`/sections/${sectionId}/alerts`, { params })
   return data
 }
 

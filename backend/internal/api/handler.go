@@ -108,7 +108,7 @@ func (h *Handler) GetSectionRealtimeData(c *gin.Context) {
 		return
 	}
 
-	alerts, _ := h.store.GetSectionAlerts(c.Request.Context(), id, 5)
+	alerts, _ := h.store.GetSectionAlerts(c.Request.Context(), id, 5, model.AlertStatusActive)
 
 	dataMap := make(map[int]interface{})
 	for _, d := range latestData {
@@ -140,7 +140,14 @@ func (h *Handler) GetSectionAlerts(c *gin.Context) {
 		}
 	}
 
-	alerts, err := h.store.GetSectionAlerts(c.Request.Context(), id, limit)
+	// 可选状态过滤：active / resolved / 空（不过滤，兼容历史）
+	status := c.Query("status")
+	if status != "" && status != string(model.AlertStatusActive) && status != string(model.AlertStatusResolved) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的告警状态"})
+		return
+	}
+
+	alerts, err := h.store.GetSectionAlerts(c.Request.Context(), id, limit, status)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

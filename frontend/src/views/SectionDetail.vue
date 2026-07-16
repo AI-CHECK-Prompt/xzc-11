@@ -24,10 +24,13 @@
           <h2>活跃告警</h2>
         </div>
         <ul class="alert-list">
-          <li v-for="alert in activeAlerts" :key="alert.id" class="alert-item" :class="alert.level">
+          <li v-for="alert in activeAlerts" :key="alert.id" class="alert-item" :class="[alert.level, alert.status]">
             <div class="alert-content">
               <div class="alert-message">{{ alert.message }}</div>
-              <div class="alert-meta">{{ formatTime(alert.triggered_at) }}</div>
+              <div class="alert-meta">
+                {{ formatTime(alert.triggered_at) }}
+                <span v-if="alert.status === 'resolved' && alert.resolved_at" class="resolved-tag">已解决 {{ formatTime(alert.resolved_at) }}</span>
+              </div>
             </div>
           </li>
         </ul>
@@ -254,11 +257,13 @@ onMounted(async () => {
     const [sectionRes, sensorsRes, alertsRes] = await Promise.all([
       api.getSection(sectionId),
       api.getSectionSensors(sectionId),
-      api.getSectionAlerts(sectionId, 10),
+      // 实时面板只关注当前活跃告警，后端按 status=active 过滤；
+      // 客户端再防御过滤一次，避免历史脏数据混入。
+      api.getSectionAlerts(sectionId, 10, 'active'),
     ])
     section.value = sectionRes.data
     sensors.value = sensorsRes.data || []
-    activeAlerts.value = alertsRes.data || []
+    activeAlerts.value = (alertsRes.data || []).filter(a => a.status === 'active')
 
     // 获取实时数据
     const realtimeRes = await api.getSectionRealtimeData(sectionId)

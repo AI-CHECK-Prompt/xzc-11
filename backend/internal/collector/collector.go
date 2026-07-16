@@ -149,7 +149,7 @@ func (c *Collector) pushRealtimeData(ctx context.Context, data []model.SensorDat
 			continue
 		}
 
-		alerts, _ := c.store.GetSectionAlerts(ctx, sectionID, 5)
+		alerts, _ := c.store.GetSectionAlerts(ctx, sectionID, 5, model.AlertStatusActive)
 
 		dataMap := make(map[int]model.SensorData)
 		for _, d := range latestData {
