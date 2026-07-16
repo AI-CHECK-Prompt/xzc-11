@@ -3,11 +3,21 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 	"tunnel-shm/internal/model"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// 速率分析关键参数（包级常量，便于测试和调整）
+const (
+	// SlidingWindow 滑动窗口时长：用于捕捉窗口内的瞬时剧烈波动
+	// 1 小时是隧道监测的常用瞬时分析窗口，可识别阶跃跳变
+	SlidingWindow = 1 * time.Hour
+	// MinStepInterval 相邻点阶跃检测的最小时间间隔，避免单点噪声被误判
+	MinStepInterval = 1 * time.Minute
 )
 
 // Store 数据库操作层
@@ -233,16 +243,27 @@ func (s *Store) GetHistoricalDataAggregated(ctx context.Context, sensorID int, s
 	return data, rows.Err()
 }
 
-// CalculateDeformationRate 计算变形速率（24小时，mm/天）
+// CalculateDeformationRate 计算 24 小时窗口内的变形速率（mm/天）
+//
+// 修正历史缺陷：原实现仅取窗口首末两点做差，未考虑中间过程的阶跃跳变
+// 与反复波动，无法识别"先抬升后回落"导致净变化小但瞬时风险极高的情况
+// （如位移在 1h 内从 12.3mm 抬升至 14.8mm，瞬时速率达 6mm/天，远超阈值）。
+//
+// 新实现采用多窗口分析，取三类速率中的最严值（绝对值最大）作为告警判定：
+//   1) EndpointRate  端点速率：(末值-首值)/实际时长*24h（兼容历史逻辑）
+//   2) MaxSlidingRate 1h 滑动窗口内的最大瞬时变化率（捕捉阶跃/波动）
+//   3) MaxStepRate   相邻数据点间的最大阶跃速率（捕捉单点突变）
+//
+// 实际计算逻辑下沉到 AnalyzeRateFromData 纯函数，便于单元测试。
 func (s *Store) CalculateDeformationRate(ctx context.Context, sensorID int) (*model.DeformationRate, error) {
 	now := time.Now()
-	yesterday := now.Add(-24 * time.Hour)
+	windowStart := now.Add(-24 * time.Hour)
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, sensor_id, value, timestamp
 		 FROM sensor_data
 		 WHERE sensor_id = $1 AND timestamp >= $2 AND timestamp <= $3
-		 ORDER BY timestamp ASC`, sensorID, yesterday, now)
+		 ORDER BY timestamp ASC`, sensorID, windowStart, now)
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +278,17 @@ func (s *Store) CalculateDeformationRate(ctx context.Context, sensorID int) (*mo
 		data = append(data, d)
 	}
 
+	return AnalyzeRateFromData(sensorID, data)
+}
+
+// AnalyzeRateFromData 纯函数：对一组有序传感器数据计算多窗口速率
+// data 必须按时间升序、至少 2 个点；返回的 DeformationRate 中
+//   - Rate: 三类速率绝对值最大者（mm/天，已归一化）
+//   - RateSource: 该最严速率的来源（endpoint / sliding / step）
+//
+// 抽取该函数的目的：与数据库 I/O 解耦，便于单元测试覆盖典型场景
+// （阶跃跳变、缓慢漂移、噪声、单点突变、首末相消等）。
+func AnalyzeRateFromData(sensorID int, data []model.SensorData) (*model.DeformationRate, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("数据点不足")
 	}
@@ -264,16 +296,122 @@ func (s *Store) CalculateDeformationRate(ctx context.Context, sensorID int) (*mo
 	first := data[0]
 	last := data[len(data)-1]
 
-	rate := last.Value - first.Value
+	// (1) 端点速率（mm/天）：兼容历史告警判定逻辑
+	var endpointRate float64
+	if hours := last.Timestamp.Sub(first.Timestamp).Hours(); hours > 0 {
+		endpointRate = (last.Value - first.Value) / hours * 24.0
+	}
+
+	// (2) 滑动窗口最大瞬时速率：对每个数据点向后续查找首个时间差
+	//     >= SlidingWindow 的点，计算两点间的归一化变化率；保留绝对值最大者。
+	//     该策略能精确捕捉 1h 内的阶跃抬升/回落场景。
+	var (
+		maxSlidingRate   float64
+		slidingStartVal  float64
+		slidingEndVal    float64
+		slidingStartTime time.Time
+		slidingEndTime   time.Time
+	)
+	for i := 0; i < len(data); i++ {
+		for j := i + 1; j < len(data); j++ {
+			span := data[j].Timestamp.Sub(data[i].Timestamp)
+			if span < SlidingWindow {
+				continue
+			}
+			hours := span.Hours()
+			if hours <= 0 {
+				break
+			}
+			rate := (data[j].Value - data[i].Value) / hours * 24.0
+			if math.Abs(rate) > math.Abs(maxSlidingRate) {
+				maxSlidingRate = rate
+				slidingStartTime = data[i].Timestamp
+				slidingEndTime = data[j].Timestamp
+				slidingStartVal = data[i].Value
+				slidingEndVal = data[j].Value
+			}
+			break // 已找到 i 之后首个达到窗口的点
+		}
+	}
+
+	// (3) 相邻点阶跃最大速率：捕捉单点突变，限定最小间隔避免噪声放大
+	var (
+		maxStepRate float64
+		stepFromVal float64
+		stepToVal   float64
+		stepFrom    time.Time
+		stepTo      time.Time
+	)
+	for i := 1; i < len(data); i++ {
+		span := data[i].Timestamp.Sub(data[i-1].Timestamp)
+		if span < MinStepInterval {
+			continue
+		}
+		hours := span.Hours()
+		if hours <= 0 {
+			continue
+		}
+		rate := (data[i].Value - data[i-1].Value) / hours * 24.0
+		if math.Abs(rate) > math.Abs(maxStepRate) {
+			maxStepRate = rate
+			stepFrom = data[i-1].Timestamp
+			stepTo = data[i].Timestamp
+			stepFromVal = data[i-1].Value
+			stepToVal = data[i].Value
+		}
+	}
+
+	// (4) 取最严速率作为告警判定依据，并记录其来源
+	rate := endpointRate
+	source := model.RateSourceEndpoint
+	if math.Abs(maxSlidingRate) > math.Abs(rate) {
+		rate = maxSlidingRate
+		source = model.RateSourceSlidingWin
+	}
+	if math.Abs(maxStepRate) > math.Abs(rate) {
+		rate = maxStepRate
+		source = model.RateSourceStep
+	}
+
+	// (5) 窗口内极值统计（用于消息展示瞬时跨度）
+	minVal, maxVal := data[0].Value, data[0].Value
+	for _, d := range data[1:] {
+		if d.Value < minVal {
+			minVal = d.Value
+		}
+		if d.Value > maxVal {
+			maxVal = d.Value
+		}
+	}
 
 	result := &model.DeformationRate{
 		SensorID:   sensorID,
 		Rate:       rate,
+		RateSource: source,
+
 		StartTime:  first.Timestamp,
 		EndTime:    last.Timestamp,
 		DataPoints: len(data),
 		LastValue:  last.Value,
 		FirstValue: first.Value,
+
+		EndpointRate: endpointRate,
+
+		MaxSlidingRate:   maxSlidingRate,
+		SlidingWindow:    SlidingWindow.String(),
+		SlidingStartTime: slidingStartTime,
+		SlidingEndTime:   slidingEndTime,
+		SlidingStartVal:  slidingStartVal,
+		SlidingEndVal:    slidingEndVal,
+
+		MaxStepRate:  maxStepRate,
+		StepFromTime: stepFrom,
+		StepToTime:   stepTo,
+		StepFromVal:  stepFromVal,
+		StepToVal:    stepToVal,
+
+		MinValue: minVal,
+		MaxValue: maxVal,
 	}
 
 	return result, nil

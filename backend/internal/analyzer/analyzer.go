@@ -93,7 +93,7 @@ func (a *Analyzer) analyzeSensor(ctx context.Context, sensor *model.Sensor, sect
 		return false
 	}
 
-	// 取绝对值
+	// rate.Rate 已是归一化到 mm/天 的最严速率（多窗口分析绝对值最大者）
 	absRate := math.Abs(rate.Rate)
 
 	var warningThreshold, dangerThreshold float64
@@ -145,13 +145,33 @@ func (a *Analyzer) analyzeSensor(ctx context.Context, sensor *model.Sensor, sect
 		direction = "减小"
 	}
 
+	// 描述触发来源：明确指出告警是源于端点差值、滑动窗口还是相邻阶跃
+	// 避免"首末两点相消"导致的漏报（如先抬升 12.3→14.8mm 再回落 12.5mm）
+	var sourceDesc string
+	var detailDesc string
+	switch rate.RateSource {
+	case model.RateSourceSlidingWin:
+		sourceDesc = fmt.Sprintf("1h滑动窗口内最大变化量 %.3f→%.3f",
+			rate.SlidingStartVal, rate.SlidingEndVal)
+		detailDesc = fmt.Sprintf("，窗口跨度=%.3fmm", math.Abs(rate.SlidingEndVal-rate.SlidingStartVal))
+	case model.RateSourceStep:
+		sourceDesc = fmt.Sprintf("相邻数据点阶跃 %.3f→%.3f",
+			rate.StepFromVal, rate.StepToVal)
+		detailDesc = fmt.Sprintf("，阶跃量=%.3fmm", math.Abs(rate.StepToVal-rate.StepFromVal))
+	default:
+		sourceDesc = fmt.Sprintf("24h端点差值 %.3f→%.3f",
+			rate.FirstValue, rate.LastValue)
+		detailDesc = ""
+	}
+
 	message := fmt.Sprintf(
-		"【%s】断面[%s](%s)传感器[%s](%s) %s变化速率 %.3fmm/天，从 %.3fmm 到 %.3fmm，超过%s阈值 %.3fmm/天",
+		"【%s】断面[%s](%s)传感器[%s](%s) %s变化速率 %.3f%s/天，触发来源=%s%s；窗口极值 %.3f~%.3f%s；超过%s阈值 %.3f",
 		level,
 		section.Code, section.Name,
 		sensor.Code, sensor.Position,
-		metricName, absRate,
-		rate.FirstValue, rate.LastValue,
+		metricName, absRate, unitSuffix(sensor.Type),
+		sourceDesc, detailDesc,
+		rate.MinValue, rate.MaxValue, unitSuffix(sensor.Type),
 		direction,
 		warningThreshold,
 	)
@@ -178,6 +198,18 @@ func (a *Analyzer) analyzeSensor(ctx context.Context, sensor *model.Sensor, sect
 	a.hub.BroadcastAlert(alert)
 
 	return true
+}
+
+// unitSuffix 返回传感器类型对应的单位后缀（用于告警消息展示）
+func unitSuffix(t model.SensorType) string {
+	switch t {
+	case model.SensorTypeDisplacement, model.SensorTypeCrack:
+		return "mm"
+	case model.SensorTypeStrain:
+		return "με"
+	default:
+		return ""
+	}
 }
 
 // AnalyzeSingleSensor 分析单个传感器（数据上报后实时检查）

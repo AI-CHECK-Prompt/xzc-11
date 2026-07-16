@@ -90,14 +90,50 @@ type SectionRealtimeData struct {
 	UpdatedAt   time.Time             `json:"updated_at"`
 }
 
+// RateSource 告警判定来源
+type RateSource string
+
+const (
+	RateSourceEndpoint   RateSource = "endpoint"   // 端点差值
+	RateSourceSlidingWin RateSource = "sliding"    // 滑动窗口最大瞬时速率
+	RateSourceStep       RateSource = "step"       // 相邻点阶跃速率
+)
+
 // DeformationRate 变形速率计算结果
+// 修正历史缺陷：原实现仅取窗口首末两点做差，无法识别中间过程的
+// 阶跃跳变与反复波动。Rate 字段为多窗口分析中的"最严值"（绝对值最大），
+// 用于告警判定；具体触发来源由 RateSource 标识，诊断信息可回溯到
+// EndpointRate / MaxSlidingRate / MaxStepRate。
 type DeformationRate struct {
-	SensorID     int       `json:"sensor_id"`
-	SectionID    int       `json:"section_id"`
-	Rate         float64   `json:"rate"` // 单位：mm/天
-	StartTime    time.Time `json:"start_time"`
-	EndTime      time.Time `json:"end_time"`
-	DataPoints   int       `json:"data_points"`
-	LastValue    float64   `json:"last_value"`
-	FirstValue   float64   `json:"first_value"`
+	SensorID   int       `json:"sensor_id"`
+	SectionID  int       `json:"section_id"`
+	Rate       float64   `json:"rate"`        // 最严速率（mm/天），告警判定用
+	RateSource RateSource `json:"rate_source"` // 触发该最严值的来源
+	StartTime  time.Time `json:"start_time"`
+	EndTime    time.Time `json:"end_time"`
+	DataPoints int       `json:"data_points"`
+	LastValue  float64   `json:"last_value"`
+	FirstValue float64   `json:"first_value"`
+
+	// 端点速率：(lastValue - firstValue) / 实际时间窗 * 24h
+	EndpointRate float64 `json:"endpoint_rate"`
+
+	// 滑动窗口最大瞬时速率：固定时长窗口内的最大变化率
+	MaxSlidingRate   float64   `json:"max_sliding_rate"`
+	SlidingWindow    string    `json:"sliding_window"`     // 窗口时长（可读）
+	SlidingStartTime time.Time `json:"sliding_start_time"`
+	SlidingEndTime   time.Time `json:"sliding_end_time"`
+	SlidingStartVal  float64   `json:"sliding_start_value"`
+	SlidingEndVal    float64   `json:"sliding_end_value"`
+
+	// 相邻点阶跃最大速率
+	MaxStepRate  float64   `json:"max_step_rate"`
+	StepFromTime time.Time `json:"step_from_time"`
+	StepToTime   time.Time `json:"step_to_time"`
+	StepFromVal  float64   `json:"step_from_value"`
+	StepToVal    float64   `json:"step_to_value"`
+
+	// 窗口内的最小/最大值（用于消息中显示瞬时跨度）
+	MinValue float64 `json:"min_value"`
+	MaxValue float64 `json:"max_value"`
 }
