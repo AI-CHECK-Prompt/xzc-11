@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # TimescaleDB 时序数据库
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: tunnel-timescaledb
+    environment:
+      POSTGRES_USER: tunnel
+      POSTGRES_PASSWORD: tunnel123
+      POSTGRES_DB: tunnel_shm
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tunnel -d tunnel_shm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Go 后端服务
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/Dockerfile.backend
+    container_name: tunnel-backend
+    environment:
+      DB_HOST: timescaledb
+      DB_PORT: "5432"
+      DB_USER: tunnel
+      DB_PASS: tunnel123
+      DB_NAME: tunnel_shm
+      SERVER_PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Vue3 前端
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    container_name: tunnel-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  timescale_data:
+    driver: local
