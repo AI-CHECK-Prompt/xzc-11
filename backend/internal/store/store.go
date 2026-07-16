@@ -571,6 +571,35 @@ func (s *Store) GetSensorByCode(ctx context.Context, code string) (*model.Sensor
 	return &se, nil
 }
 
+// GetSensorsCalibrationByIDs 批量获取多个传感器的校准系数
+// 用于采集接口：RS485 采集器上报数据后，必须按每台传感器的
+// calibration 系数做修正后再入库，避免出现"出厂系数 1.05 入库 1.0"
+// 这类系统性偏差。返回值为 sensorID -> calibration 映射；
+// 找不到的 sensorID 不会出现在结果中，调用方应按 1.0 默认处理。
+func (s *Store) GetSensorsCalibrationByIDs(ctx context.Context, sensorIDs []int) (map[int]float64, error) {
+	if len(sensorIDs) == 0 {
+		return map[int]float64{}, nil
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, calibration FROM sensors WHERE id = ANY($1)`, sensorIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[int]float64, len(sensorIDs))
+	for rows.Next() {
+		var id int
+		var cal float64
+		if err := rows.Scan(&id, &cal); err != nil {
+			return nil, err
+		}
+		result[id] = cal
+	}
+	return result, rows.Err()
+}
+
 // GetSensorWithSection 获取传感器及其所属断面信息
 func (s *Store) GetSensorWithSection(ctx context.Context, sensorID int) (*model.Sensor, *model.Section, error) {
 	sensor, err := s.GetSensor(ctx, sensorID)
