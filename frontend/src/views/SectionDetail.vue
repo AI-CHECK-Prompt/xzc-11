@@ -47,17 +47,31 @@
       <div class="sensor-list">
         <div v-for="sensor in sensors" :key="sensor.id" class="sensor-detail-card">
           <div class="sensor-header">
-            <span>{{ sensorTypeLabel(sensor.type) }} - {{ sensor.position }}</span>
+            <span>
+              <span
+                class="sensor-status-dot"
+                :class="getSensorStatusClass(sensor.id)"
+                :title="getSensorStatusTooltip(sensor.id)"
+              ></span>
+              {{ sensorTypeLabel(sensor.type) }} - {{ sensor.position }}
+            </span>
             <span style="font-size:12px; color:var(--text-secondary);">{{ sensor.code }}</span>
           </div>
           <div class="sensor-body">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
               <div>
-                <span class="sensor-value">{{ getLatestValue(sensor.id)?.toFixed(3) || '--' }}</span>
+                <span class="sensor-value" :class="getSensorValueClass(sensor.id)">
+                  {{ getLatestValue(sensor.id)?.toFixed(3) || '--' }}
+                </span>
                 <span class="sensor-value unit"> {{ sensorUnit(sensor.type) }}</span>
               </div>
               <div v-if="getLatestData(sensor.id)" style="font-size:12px; color:var(--text-secondary);">
-                {{ formatTime(getLatestData(sensor.id)!.timestamp) }}
+                <div>{{ formatTime(getLatestData(sensor.id)!.timestamp) }}</div>
+                <div v-if="getSensorStatusLabel(sensor.id) !== '在线'"
+                     :class="getSensorStatusTextClass(sensor.id)"
+                     style="margin-top:2px;">
+                  {{ getSensorStatusLabel(sensor.id) }}
+                </div>
               </div>
             </div>
             <div style="font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
@@ -118,6 +132,9 @@ const sensors = ref<Sensor[]>([])
 const activeAlerts = ref<Alert[]>([])
 const latestData = ref<Record<number, SensorData>>({})
 const deformationRates = ref<Record<number, DeformationRate>>({})
+// 存活感知：每台传感器的在线状态（key=sensorID）
+// 由后端 /sections/:id/realtime 接口返回，缺省视为 online
+const liveness = ref<Record<number, SensorLiveness>>({})
 
 const selectedSensorId = ref<number | null>(null)
 const selectedSensor = ref<Sensor | null>(null)
@@ -170,6 +187,65 @@ function getRateColor(rate: number | undefined) {
 function formatRate(rate: number | undefined) {
   if (rate === undefined) return '--'
   return (rate > 0 ? '+' : '') + rate.toFixed(4)
+}
+
+// ========== 存活感知辅助函数 ==========
+// 缺省视为 online（向后兼容：后端未返回 liveness 时不显示离线标识）
+function getLivenessState(sensorId: number): SensorOnlineState {
+  return liveness.value[sensorId]?.state || 'online'
+}
+
+function getSensorStatusClass(sensorId: number) {
+  // 对应 main.css 的 .sensor-status-dot 样式
+  return 'sensor-status-' + getLivenessState(sensorId)
+}
+
+function getSensorStatusTextClass(sensorId: number) {
+  const state = getLivenessState(sensorId)
+  if (state === 'offline' || state === 'unknown') return 'sensor-status-text-danger'
+  if (state === 'stale') return 'sensor-status-text-warning'
+  return 'sensor-status-text-success'
+}
+
+function getSensorValueClass(sensorId: number) {
+  // 离线/未上报的传感器，其显示值是陈旧数据，给出弱化样式提示
+  const state = getLivenessState(sensorId)
+  if (state === 'offline' || state === 'unknown') return 'sensor-value-stale'
+  return ''
+}
+
+function getSensorStatusLabel(sensorId: number) {
+  const lv = liveness.value[sensorId]
+  if (!lv) return '在线'
+  switch (lv.state) {
+    case 'online':
+      return '在线'
+    case 'stale':
+      return `亚健康(${lv.minutes_since_last_data}分钟)`
+    case 'offline':
+      return `离线(${lv.minutes_since_last_data}分钟)`
+    case 'unknown':
+      return '未上报数据'
+    default:
+      return '在线'
+  }
+}
+
+function getSensorStatusTooltip(sensorId: number) {
+  const lv = liveness.value[sensorId]
+  if (!lv) return '设备在线'
+  switch (lv.state) {
+    case 'online':
+      return `设备在线（最近数据 ${lv.minutes_since_last_data} 分钟前）`
+    case 'stale':
+      return `设备亚健康：最近 ${lv.minutes_since_last_data} 分钟无数据（阈值 30 分钟）`
+    case 'offline':
+      return `设备离线：已 ${lv.minutes_since_last_data} 分钟无数据，疑似通信异常或电源故障`
+    case 'unknown':
+      return '设备从未上报数据，疑似未上线或接线故障'
+    default:
+      return ''
+  }
 }
 
 function formatTime(t: string) {
@@ -276,6 +352,10 @@ onMounted(async () => {
     const realtimeRes = await api.getSectionRealtimeData(sectionId)
     if (realtimeRes.latest_data) {
       latestData.value = realtimeRes.latest_data
+    }
+    // 存活感知：拉取每台传感器的在线状态（缺省视为空对象，向后兼容）
+    if (realtimeRes.liveness) {
+      liveness.value = realtimeRes.liveness
     }
 
     // 获取变形速率

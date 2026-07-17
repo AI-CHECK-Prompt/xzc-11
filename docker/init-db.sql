@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     section_id INTEGER NOT NULL,
     sensor_id INTEGER NOT NULL,
     level VARCHAR(20) NOT NULL,
+    -- 告警类型：rate（速率超阈值） / offline（设备离线 / 数据缺失）
+    -- 旧表无该列时由 backend 启动时 ALTER 补齐
+    type VARCHAR(20) NOT NULL DEFAULT 'rate',
     message TEXT NOT NULL,
     deformation_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
     threshold DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -56,6 +59,8 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status);
 CREATE INDEX IF NOT EXISTS idx_alerts_section ON alerts (section_id, triggered_at DESC);
+-- 告警类型索引：用于存活感知 cron 判重（offline 类型 30 分钟内不重复）
+CREATE INDEX IF NOT EXISTS idx_alerts_sensor_type_time ON alerts (sensor_id, type, triggered_at DESC);
 
 -- 数据保留策略：3年
 SELECT add_retention_policy('sensor_data', INTERVAL '3 years', if_not_exists => TRUE);

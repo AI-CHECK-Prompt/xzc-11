@@ -39,6 +39,9 @@ interface Alert {
   section_id: number
   sensor_id: number
   level: 'info' | 'warning' | 'danger'
+  // 告警类型：rate=速率超阈值 / offline=设备离线
+  // 缺省为 rate，向后兼容历史告警数据
+  type?: 'rate' | 'offline'
   message: string
   deformation_rate: number
   threshold: number
@@ -53,7 +56,29 @@ interface SectionRealtimeData {
   section_name: string
   latest_data: Record<number, SensorData>
   alerts: Alert[]
+  // 存活感知：每台传感器的在线状态（key=sensorID）
+  // 用于前端在 sensor-data 是"陈旧值"时显示"离线/亚健康"标识
+  liveness?: Record<number, SensorLiveness>
   updated_at: string
+}
+
+// 传感器存活状态类型
+//   - online  : 最近一次数据在 10 分钟内，正常
+//   - stale   : 最近一次数据在 10~30 分钟内，亚健康
+//   - offline : 最近一次数据超过 30 分钟，离线
+//   - unknown : 从未上报过数据
+type SensorOnlineState = 'online' | 'stale' | 'offline' | 'unknown'
+
+interface SensorLiveness {
+  sensor_id: number
+  section_id: number
+  // 最近一次数据上报时间；null 表示从未上报
+  last_data_at: string | null
+  state: SensorOnlineState
+  // 距上次上报的分钟数；-1 表示从未上报
+  minutes_since_last_data: number
+  // 业务约定的期望上报周期（分钟）
+  expected_interval_min: number
 }
 
 interface DeformationRate {
@@ -92,6 +117,10 @@ interface DashboardOverview {
   danger_alerts: number
   warning_alerts: number
   active_alerts: number
+  // 存活感知：当前处于离线/未上报状态的传感器数
+  // 与 offline_alerts（待人工处理的告警）共同反映设备健康度
+  offline_sensors?: number
+  offline_alerts?: number
 }
 
 interface WSMessage {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
@@ -34,11 +35,15 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.GET("/sections/:id/sensors", h.GetSectionSensors)
 		api.GET("/sections/:id/realtime", h.GetSectionRealtimeData)
 		api.GET("/sections/:id/alerts", h.GetSectionAlerts)
+		// 存活感知：拉取某断面下所有传感器的在线状态
+		api.GET("/sections/:id/liveness", h.GetSectionLiveness)
 
 		// 传感器相关
 		api.GET("/sensors/:id", h.GetSensor)
 		api.GET("/sensors/:id/data", h.GetSensorData)
 		api.GET("/sensors/:id/rate", h.GetSensorDeformationRate)
+		// 存活感知：拉取单台传感器的在线状态
+		api.GET("/sensors/:id/liveness", h.GetSensorLiveness)
 
 		// 告警相关
 		api.GET("/alerts", h.GetAlerts)
@@ -50,7 +55,63 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 		// 调试用：立刻分析某断面的所有传感器（验收脚本使用）
 		api.POST("/debug/sections/:id/analyze", h.AnalyzeSectionForTest)
+		// 调试用：立刻执行全量存活感知扫描
+		api.POST("/debug/detect-offline", h.DebugDetectOffline)
 	}
+}
+
+// GetSectionLiveness 拉取某断面下所有传感器的在线状态
+func (h *Handler) GetSectionLiveness(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的断面ID"})
+		return
+	}
+	items, err := h.analyzer.GetSensorsLivenessBySection(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": items, "total": len(items)})
+}
+
+// GetSensorLiveness 拉取单台传感器的在线状态
+func (h *Handler) GetSensorLiveness(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的传感器ID"})
+		return
+	}
+	sensor, err := h.store.GetSensor(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "传感器不存在"})
+		return
+	}
+	items, err := h.analyzer.GetSensorsLivenessBySection(c.Request.Context(), sensor.SectionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for _, lv := range items {
+		if lv.SensorID == id {
+			c.JSON(http.StatusOK, gin.H{"data": lv})
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "未找到该传感器的存活状态"})
+}
+
+// DebugDetectOffline 调试用：立刻执行全量存活感知扫描
+//
+// 验收/测试场景：停止某个 simulator 上报一段时间后，调用本接口立即触发扫描，
+// 不必等待 5 分钟 cron。生产环境慎用——会与 cron 同时抢占 DB 连接。
+func (h *Handler) DebugDetectOffline(c *gin.Context) {
+	if h.analyzer == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "analyzer 未注入"})
+		return
+	}
+	h.analyzer.DetectOfflineSensors(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
 
 // GetSections 获取所有断面
@@ -122,12 +183,22 @@ func (h *Handler) GetSectionRealtimeData(c *gin.Context) {
 		dataMap[d.SensorID] = d
 	}
 
+	// 存活感知：附加每台传感器的在线状态
+	// 修复"设备离线但前端仍显示在线"问题——即使 sensor_data 中有历史值，
+	// 若最后一次上报超过 stale 阈值，前端必须显示"亚健康/离线"。
+	liveness, _ := h.analyzer.GetSensorsLivenessBySection(c.Request.Context(), id)
+	livenessMap := make(map[int]model.SensorLiveness, len(liveness))
+	for _, lv := range liveness {
+		livenessMap[lv.SensorID] = lv
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"section_id":   section.ID,
 		"section_code": section.Code,
 		"section_name": section.Name,
 		"latest_data":  dataMap,
 		"alerts":       alerts,
+		"liveness":     livenessMap,
 		"updated_at":   time.Now(),
 	})
 }
@@ -297,6 +368,7 @@ func (h *Handler) GetDashboardOverview(c *gin.Context) {
 	// 统计告警级别
 	dangerCount := 0
 	warningCount := 0
+	offlineAlertCount := 0
 	for _, a := range alerts {
 		switch a.Level {
 		case model.AlertLevelDanger:
@@ -304,15 +376,55 @@ func (h *Handler) GetDashboardOverview(c *gin.Context) {
 		case model.AlertLevelWarning:
 			warningCount++
 		}
+		if a.Type == model.AlertTypeOffline {
+			offlineAlertCount++
+		}
 	}
 
+	// 存活感知：实时统计当前离线的传感器数量（与告警去重周期无关，
+	// 只要"最近一次上报超过 30 分钟"就计入离线数）
+	offlineSensors, _ := h.countOfflineSensors(c.Request.Context())
+
 	c.JSON(http.StatusOK, gin.H{
-		"total_sections": len(sections),
-		"total_alerts":   len(alerts),
-		"danger_alerts":  dangerCount,
-		"warning_alerts": warningCount,
-		"active_alerts":  len(alerts),
+		"total_sections":      len(sections),
+		"total_alerts":        len(alerts),
+		"danger_alerts":       dangerCount,
+		"warning_alerts":      warningCount,
+		"active_alerts":       len(alerts),
+		"offline_sensors":     offlineSensors,
+		"offline_alerts":      offlineAlertCount,
 	})
+}
+
+// countOfflineSensors 实时统计当前处于离线状态的传感器数量
+// 用于 Dashboard 概览卡片展示，与"offline_alerts"（告警去重后的活跃数）互为补充：
+//   - offline_sensors : 反映"瞬时"离线传感器数（每 5 分钟刷新）
+//   - offline_alerts  : 反映"待人工处理"的离线告警数（30 分钟内同级别去重）
+func (h *Handler) countOfflineSensors(ctx context.Context) (int, error) {
+	pairs, err := h.store.GetSensorsWithSections(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(pairs) == 0 {
+		return 0, nil
+	}
+	ids := make([]int, 0, len(pairs))
+	for _, p := range pairs {
+		ids = append(ids, p.SensorID)
+	}
+	lastDataMap, err := h.store.GetSensorsLastDataAt(ctx, ids)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	offline := 0
+	for _, p := range pairs {
+		state, _ := store.ComputeSensorState(lastDataMap[p.SensorID], now)
+		if state == model.SensorStateOffline || state == model.SensorStateUnknown {
+			offline++
+		}
+	}
+	return offline, nil
 }
 
 // AnalyzeSectionForTest 触发某断面的全量告警分析（绕过 5 分钟 cron）

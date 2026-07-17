@@ -52,6 +52,11 @@ func (s *Store) Close() {
 }
 
 // InitSchema 初始化数据库表结构
+//
+// 同步执行建表与列迁移：
+//   - 新部署：完整执行 schema 中的 CREATE TABLE
+//   - 已有库：检查 alerts.type 列是否存在，缺失则 ALTER TABLE 补齐
+//     （用于向后兼容存量部署，避免新字段上线时报"column does not exist"）
 func (s *Store) InitSchema(ctx context.Context) error {
 	schema := `
 	-- 创建TimescaleDB扩展
@@ -102,6 +107,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		section_id INTEGER NOT NULL,
 		sensor_id INTEGER NOT NULL,
 		level VARCHAR(20) NOT NULL,
+		type VARCHAR(20) NOT NULL DEFAULT 'rate',
 		message TEXT NOT NULL,
 		deformation_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
 		threshold DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -112,6 +118,8 @@ func (s *Store) InitSchema(ctx context.Context) error {
 
 	CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status);
 	CREATE INDEX IF NOT EXISTS idx_alerts_section ON alerts (section_id, triggered_at DESC);
+	-- 告警类型索引：用于存活感知 cron 判重（offline 类型 30 分钟内不重复）
+	CREATE INDEX IF NOT EXISTS idx_alerts_sensor_type_time ON alerts (sensor_id, type, triggered_at DESC);
 
 	-- 数据保留策略：自动删除3年前的数据
 	SELECT add_retention_policy('sensor_data', INTERVAL '3 years', if_not_exists => TRUE);
@@ -192,6 +200,26 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	SELECT add_retention_policy('section_health_score_intermediate', INTERVAL '3 years', if_not_exists => TRUE);
 	`
 	_, err := s.pool.Exec(ctx, schema)
+	if err != nil {
+		return err
+	}
+
+	// 兼容历史库：alerts 表缺 type 列时补齐（存活感知告警需要该字段）
+	// 采用 IF NOT EXISTS 语义：PostgreSQL 不支持 ADD COLUMN IF NOT EXISTS 旧版本，
+	// 这里通过查询 information_schema 自行判断后再 ALTER，避免在已升级库上抛错。
+	_, err = s.pool.Exec(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_name = 'alerts' AND column_name = 'type'
+			) THEN
+				ALTER TABLE alerts ADD COLUMN type VARCHAR(20) NOT NULL DEFAULT 'rate';
+			END IF;
+		END $$;
+		CREATE INDEX IF NOT EXISTS idx_alerts_sensor_type_time
+			ON alerts (sensor_id, type, triggered_at DESC);
+	`)
 	return err
 }
 
@@ -493,12 +521,19 @@ func AnalyzeRateFromData(sensorID int, data []model.SensorData) (*model.Deformat
 }
 
 // InsertAlert 插入告警
+//
+// type 字段用于区分告警触发原因（rate=速率超阈值/offline=设备离线），
+// 缺省 'rate'，保持与历史告警数据兼容。
 func (s *Store) InsertAlert(ctx context.Context, alert *model.Alert) error {
+	alertType := alert.Type
+	if alertType == "" {
+		alertType = model.AlertTypeRate
+	}
 	return s.pool.QueryRow(ctx,
-		`INSERT INTO alerts (section_id, sensor_id, level, message, deformation_rate, threshold, status, triggered_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO alerts (section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id`,
-		alert.SectionID, alert.SensorID, alert.Level, alert.Message,
+		alert.SectionID, alert.SensorID, alert.Level, alertType, alert.Message,
 		alert.DeformationRate, alert.Threshold, alert.Status, alert.TriggeredAt,
 	).Scan(&alert.ID)
 }
@@ -506,7 +541,7 @@ func (s *Store) InsertAlert(ctx context.Context, alert *model.Alert) error {
 // GetActiveAlerts 获取活跃告警
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, section_id, sensor_id, level, message, deformation_rate, threshold, status, triggered_at, resolved_at
+		`SELECT id, section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at, resolved_at
 		 FROM alerts
 		 WHERE status = 'active'
 		 ORDER BY triggered_at DESC`)
@@ -518,7 +553,7 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 	var alerts []model.Alert
 	for rows.Next() {
 		var a model.Alert
-		if err := rows.Scan(&a.ID, &a.SectionID, &a.SensorID, &a.Level, &a.Message,
+		if err := rows.Scan(&a.ID, &a.SectionID, &a.SensorID, &a.Level, &a.Type, &a.Message,
 			&a.DeformationRate, &a.Threshold, &a.Status, &a.TriggeredAt, &a.ResolvedAt); err != nil {
 			return nil, err
 		}
@@ -531,7 +566,7 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 // status 传空字符串表示不过滤状态（兼容历史调用方）；
 // 传入 "active" / "resolved" 时按状态精确过滤，避免实时面板混入已解决告警。
 func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int, status string) ([]model.Alert, error) {
-	query := `SELECT id, section_id, sensor_id, level, message, deformation_rate, threshold, status, triggered_at, resolved_at
+	query := `SELECT id, section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at, resolved_at
 		 FROM alerts
 		 WHERE section_id = $1`
 	args := []interface{}{sectionID}
@@ -554,7 +589,7 @@ func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int, 
 	var alerts []model.Alert
 	for rows.Next() {
 		var a model.Alert
-		if err := rows.Scan(&a.ID, &a.SectionID, &a.SensorID, &a.Level, &a.Message,
+		if err := rows.Scan(&a.ID, &a.SectionID, &a.SensorID, &a.Level, &a.Type, &a.Message,
 			&a.DeformationRate, &a.Threshold, &a.Status, &a.TriggeredAt, &a.ResolvedAt); err != nil {
 			return nil, err
 		}
@@ -700,16 +735,139 @@ func (s *Store) GetSensorWithSection(ctx context.Context, sensorID int) (*model.
 }
 
 // CheckRecentAlert 检查最近是否有相同告警（防止重复告警）
-func (s *Store) CheckRecentAlert(ctx context.Context, sensorID int, level model.AlertLevel, withinMinutes int) (bool, error) {
-	var count int
-	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM alerts
+//
+// type 传空字符串时不过滤类型（兼容历史调用方），用于"速率超阈值"告警；
+// 传入 AlertTypeOffline 后只查同类型告警，避免与"设备离线"告警互相抑制。
+func (s *Store) CheckRecentAlert(ctx context.Context, sensorID int, level model.AlertLevel, withinMinutes int, alertType model.AlertType) (bool, error) {
+	query := `SELECT COUNT(*) FROM alerts
 		 WHERE sensor_id = $1 AND level = $2 AND status = 'active'
-		 AND triggered_at > NOW() - INTERVAL '1 minute' * $3`, sensorID, level, withinMinutes).Scan(&count)
-	if err != nil {
+		 AND triggered_at > NOW() - INTERVAL '1 minute' * $3`
+	args := []interface{}{sensorID, level, withinMinutes}
+	if alertType != "" {
+		query += ` AND type = $4`
+		args = append(args, alertType)
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, query, args...).Scan(&count); err != nil {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// ===========================================
+// 传感器存活感知（liveness / online status）
+// ===========================================
+
+// 存活感知关键阈值（包级常量，便于测试和调整）
+//
+// 设计依据：
+//   - 业务约定采样周期为 5 分钟（见 healthscore.scheduler 中 expected := 7*24*12）
+//   - 10 分钟无数据：可能是网络瞬抖，不告警但前端标"亚健康"提示运维关注
+//   - 30 分钟无数据：连续 6 个周期缺失，触发"数据缺失"告警（warning）
+//   - 120 分钟无数据：连续 24 个周期缺失，已远超日常维护周期，升级为 danger
+const (
+	// SensorOnlineThreshold  在线判定上限：最近一次数据距今不超过该值
+	SensorOnlineThreshold = 10 * time.Minute
+	// SensorStaleThreshold   亚健康判定上限：[online, stale) 为亚健康
+	SensorStaleThreshold = 30 * time.Minute
+	// SensorOfflineWarningThreshold 离线告警触发阈值（warning）
+	SensorOfflineWarningThreshold = 30 * time.Minute
+	// SensorOfflineDangerThreshold  离线告警升级阈值（danger）
+	SensorOfflineDangerThreshold = 120 * time.Minute
+	// SensorExpectedIntervalMin 业务约定的期望上报周期（分钟），与 healthscore 对齐
+	SensorExpectedIntervalMin = 5
+)
+
+// GetSensorLastDataAt 拉取单台传感器的最近一次上报时间
+// 返回 nil 表示从未上报过数据（场景：设备刚部署、传感器被删除后重建等）
+func (s *Store) GetSensorLastDataAt(ctx context.Context, sensorID int) (*time.Time, error) {
+	var ts *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT MAX(timestamp) FROM sensor_data WHERE sensor_id = $1`, sensorID,
+	).Scan(&ts)
+	if err != nil {
+		return nil, err
+	}
+	return ts, nil
+}
+
+// GetSensorsLastDataAt 批量拉取多台传感器的最近一次上报时间
+// 返回 map：sensorID -> *time.Time（值为 nil 表示该传感器从未上报）
+//
+// 用于存活感知全量扫描：单次 SQL 拿全所有传感器的最后上报时间，
+// 避免 N 次 GetSensorLastDataAt 造成的 round-trip 开销。
+func (s *Store) GetSensorsLastDataAt(ctx context.Context, sensorIDs []int) (map[int]*time.Time, error) {
+	if len(sensorIDs) == 0 {
+		return map[int]*time.Time{}, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT sensor_id, MAX(timestamp) FROM sensor_data
+		 WHERE sensor_id = ANY($1)
+		 GROUP BY sensor_id`, sensorIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int]*time.Time, len(sensorIDs))
+	for rows.Next() {
+		var id int
+		var ts *time.Time
+		if err := rows.Scan(&id, &ts); err != nil {
+			return nil, err
+		}
+		result[id] = ts
+	}
+	// 未上报过的传感器在 map 中不存在，调用方按 nil 处理
+	return result, rows.Err()
+}
+
+// ComputeSensorState 纯函数：根据最近上报时间与当前时间判定在线状态
+//
+// 状态分档：
+//   - 距今 < 10min              -> online
+//   - 10min <= 距今 < 30min     -> stale
+//   - 距今 >= 30min             -> offline
+//   - 从未上报                  -> unknown
+//
+// 抽取为纯函数便于单元测试覆盖各种边界场景。
+func ComputeSensorState(lastDataAt *time.Time, now time.Time) (model.SensorOnlineState, int) {
+	if lastDataAt == nil {
+		return model.SensorStateUnknown, -1
+	}
+	mins := int(now.Sub(*lastDataAt).Minutes())
+	switch {
+	case mins < int(SensorOnlineThreshold.Minutes()):
+		return model.SensorStateOnline, mins
+	case mins < int(SensorStaleThreshold.Minutes()):
+		return model.SensorStateStale, mins
+	default:
+		return model.SensorStateOffline, mins
+	}
+}
+
+// GetSensorsWithSections 拉取所有传感器及其所属断面 ID
+// 用于存活感知全量扫描的输入数据
+type SensorSectionPair struct {
+	SensorID  int
+	SectionID int
+}
+
+func (s *Store) GetSensorsWithSections(ctx context.Context) ([]SensorSectionPair, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, section_id FROM sensors`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SensorSectionPair
+	for rows.Next() {
+		var p SensorSectionPair
+		if err := rows.Scan(&p.SensorID, &p.SectionID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // ===========================================

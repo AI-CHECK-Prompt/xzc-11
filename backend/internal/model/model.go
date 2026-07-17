@@ -30,6 +30,27 @@ const (
 	AlertStatusResolved AlertStatus = "resolved"
 )
 
+// AlertType 告警类型
+// 区分告警触发原因，便于前端分类展示与告警引擎覆盖范围分析。
+//   - AlertTypeRate  : 变形速率超阈值（原始告警类型，向后兼容缺省值）
+//   - AlertTypeOffline: 设备离线 / 数据缺失（存活感知）
+type AlertType string
+
+const (
+	AlertTypeRate    AlertType = "rate"     // 速率超阈值告警（默认类型）
+	AlertTypeOffline AlertType = "offline"  // 设备离线 / 数据缺失告警
+)
+
+// SensorOnlineState 传感器在线状态
+type SensorOnlineState string
+
+const (
+	SensorStateOnline  SensorOnlineState = "online"  // 在线（最近一次数据在 10 分钟内）
+	SensorStateStale   SensorOnlineState = "stale"   // 亚健康（最近一次数据在 [10min, 30min)）
+	SensorStateOffline SensorOnlineState = "offline" // 离线（最近一次数据 >= 30min）
+	SensorStateUnknown SensorOnlineState = "unknown" // 未知（从未上报过数据）
+)
+
 // Section 监测断面
 type Section struct {
 	ID          int                 `json:"id"`
@@ -73,12 +94,28 @@ type Alert struct {
 	SectionID    int           `json:"section_id"`
 	SensorID     int           `json:"sensor_id"`
 	Level        AlertLevel    `json:"level"`
+	Type         AlertType     `json:"type"`            // 告警类型（rate/offline），缺省 rate
 	Message      string        `json:"message"`
 	DeformationRate float64   `json:"deformation_rate"`
 	Threshold    float64       `json:"threshold"`
 	Status       AlertStatus   `json:"status"`
 	TriggeredAt  time.Time     `json:"triggered_at"`
 	ResolvedAt   *time.Time    `json:"resolved_at"`
+}
+
+// SensorLiveness 传感器存活/在线状态
+// 用于存活感知接口，告诉前端"这台设备是否还活着"。
+//   - LastDataAt : 最近一次上报时间（NULL 表示从未上报）
+//   - State      : online / stale / offline / unknown
+//   - MinutesSinceLastData : 距上次上报的分钟数，-1 表示从未上报
+//   - ExpectedIntervalMin  : 期望上报周期（分钟），用于前端展示
+type SensorLiveness struct {
+	SensorID            int               `json:"sensor_id"`
+	SectionID           int               `json:"section_id"`
+	LastDataAt          *time.Time        `json:"last_data_at"`
+	State               SensorOnlineState `json:"state"`
+	MinutesSinceLastData int              `json:"minutes_since_last_data"`
+	ExpectedIntervalMin  int              `json:"expected_interval_min"`
 }
 
 // SectionRealtimeData 断面实时数据

@@ -22,8 +22,17 @@
           <div class="stat-label">警告告警</div>
         </div>
       </div>
+      <div class="stat-card" :class="{ 'stat-card-warn': (overview?.offline_sensors || 0) > 0 }">
+        <div class="stat-icon" :class="(overview?.offline_sensors || 0) > 0 ? 'red' : 'green'">
+          {{ (overview?.offline_sensors || 0) > 0 ? '⚠️' : '✅' }}
+        </div>
+        <div>
+          <div class="stat-value">{{ overview?.offline_sensors || 0 }}</div>
+          <div class="stat-label">离线传感器</div>
+        </div>
+      </div>
       <div class="stat-card">
-        <div class="stat-icon green">✅</div>
+        <div class="stat-icon green">📊</div>
         <div>
           <div class="stat-value">{{ normalSections }}</div>
           <div class="stat-label">正常断面</div>

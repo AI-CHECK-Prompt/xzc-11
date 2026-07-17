@@ -119,13 +119,22 @@ func main() {
 		go client.ReadPump(hub)
 	})
 
-	// 定时任务：每5分钟执行一次全量分析
+	// 定时任务：
+	//   - 速率告警分析：每 5 分钟的整 5 分钟位（xx:00, xx:05, xx:10...）执行
+	//   - 存活感知扫描：每 5 分钟的整 10 分钟位（xx:00, xx:10, xx:20...）执行
+	// 两个任务错开 2~3 分钟，避免同一时刻大量 SQL 抢占连接池
 	c := cron.New()
 	c.AddFunc("*/5 * * * *", func() {
 		anal.AnalyzeAllSensors(context.Background())
 	})
+	c.AddFunc("2-59/5 * * * *", func() {
+		// 2/7/12/17/22/27/32/37/42/47/52/57 分触发
+		// 与速率告警分析（0/5/10/15/...）错开至少 2 分钟
+		anal.DetectOfflineSensors(context.Background())
+	})
 	c.Start()
-	log.Println("【系统-定时】告警分析定时任务已启动（每5分钟）")
+	log.Println("【系统-定时】告警分析定时任务已启动（每5分钟错峰）")
+	log.Println("【系统-定时】存活感知定时任务已启动（每5分钟错峰）")
 
 	// 启动HTTP服务
 	srv := &http.Server{

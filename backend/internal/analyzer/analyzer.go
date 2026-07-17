@@ -133,7 +133,8 @@ func (a *Analyzer) analyzeSensor(ctx context.Context, sensor *model.Sensor, sect
 	}
 
 	// 防重复告警（30分钟内相同告警不重复发送）
-	hasRecent, err := a.store.CheckRecentAlert(ctx, sensor.ID, level, 30)
+	// 按告警类型维度判重：rate 与 offline 是两个独立维度，不会互相抑制
+	hasRecent, err := a.store.CheckRecentAlert(ctx, sensor.ID, level, 30, model.AlertTypeRate)
 	if err != nil {
 		log.Printf("【分析-错误】检查重复告警失败: %v", err)
 	}
@@ -253,6 +254,208 @@ func (a *Analyzer) AnalyzeSectionByID(ctx context.Context, sectionID int) {
 		}
 	}
 	log.Printf("【分析-断面】断面[%s] 分析完成，触发告警=%d", sec.Code, cnt)
+}
+
+// DetectOfflineSensors 存活感知：检测所有未按预期上报数据的传感器
+//
+// 触发逻辑：
+//   - 30 分钟无数据 → warning 告警（"数据缺失"）
+//   - 120 分钟无数据 → danger 告警（升级为"设备离线"）
+//   - 从未上报数据 → danger 告警（"设备未上线"）
+//
+// 防重复：
+//   - 同传感器同级别离线告警 30 分钟内不重复触发
+//   - 30 分钟无数据触发 warning 后又持续到 120 分钟，会自动升级为 danger
+//     （因为 danger 的 30min 窗口会覆盖前一次的 warning）
+//
+// 设计要点：
+//   - 单次 SQL 拉取所有传感器最近一次上报时间，避免 N 次 round-trip
+//   - 不修改 sensors 表结构（"在线状态"是查询时实时计算的派生量，
+//     与 deployment 状态解耦，避免采集器误更新 last_seen 字段）
+//   - 一旦发现离线传感器，复用现有告警通道（alerts 表 + WebSocket 广播），
+//     保证前端能在仪表盘上立刻看到
+func (a *Analyzer) DetectOfflineSensors(ctx context.Context) {
+	startTime := time.Now()
+
+	pairs, err := a.store.GetSensorsWithSections(ctx)
+	if err != nil {
+		log.Printf("【分析-错误】获取传感器列表失败: %v", err)
+		return
+	}
+	if len(pairs) == 0 {
+		return
+	}
+
+	// 构造 sensorID 列表，单次 SQL 拉取所有最后上报时间
+	ids := make([]int, 0, len(pairs))
+	for _, p := range pairs {
+		ids = append(ids, p.SensorID)
+	}
+	lastDataMap, err := a.store.GetSensorsLastDataAt(ctx, ids)
+	if err != nil {
+		log.Printf("【分析-错误】批量获取最近上报时间失败: %v", err)
+		return
+	}
+
+	now := time.Now()
+	offlineCount := 0
+	staleCount := 0
+	unknownCount := 0
+	alertCount := 0
+
+	for _, p := range pairs {
+		lastData := lastDataMap[p.SensorID]
+		state, mins := store.ComputeSensorState(lastData, now)
+
+		switch state {
+		case model.SensorStateOffline:
+			offlineCount++
+		case model.SensorStateStale:
+			staleCount++
+		case model.SensorStateUnknown:
+			unknownCount++
+		default:
+			continue
+		}
+
+		// 离线与未上报的传感器需要进一步告警判定
+		// 亚健康（stale）只统计不上报，避免误报
+		if a.checkAndInsertOfflineAlert(ctx, p.SensorID, p.SectionID, state, mins) {
+			alertCount++
+		}
+	}
+
+	elapsed := time.Since(startTime)
+	log.Printf("【分析-存活】扫描完成 传感器=%d 离线=%d 亚健康=%d 未上线=%d 触发告警=%d 耗时=%v",
+		len(pairs), offlineCount, staleCount, unknownCount, alertCount, elapsed)
+}
+
+// checkAndInsertOfflineAlert 检查并插入离线告警（纯流程控制，无 SQL 外依赖）
+// 返回是否成功触发了新告警（用于上层统计）
+//
+// thresholdMinutes 决定告警级别：
+//   - mins == -1（从未上报） 或 mins >= SensorOfflineDangerThreshold (120min) -> danger
+//   - 其余（30 <= mins < 120） -> warning
+func (a *Analyzer) checkAndInsertOfflineAlert(
+	ctx context.Context, sensorID, sectionID int,
+	state model.SensorOnlineState, mins int,
+) bool {
+	var level model.AlertLevel
+	switch {
+	case state == model.SensorStateUnknown:
+		// 从未上报视为最高级别（部署后一直没工作 = 最严重）
+		level = model.AlertLevelDanger
+	case mins >= int(store.SensorOfflineDangerThreshold.Minutes()):
+		level = model.AlertLevelDanger
+	default:
+		level = model.AlertLevelWarning
+	}
+
+	// 防重复：同传感器同级别同类型告警 30 分钟内不重复
+	hasRecent, err := a.store.CheckRecentAlert(ctx, sensorID, level, 30, model.AlertTypeOffline)
+	if err != nil {
+		log.Printf("【分析-错误】检查离线告警去重失败: %v", err)
+	}
+	if hasRecent {
+		return false
+	}
+
+	// 拉取传感器与断面元信息，用于生成可读告警消息
+	sensor, err := a.store.GetSensor(ctx, sensorID)
+	if err != nil {
+		log.Printf("【分析-错误】获取传感器[%d]信息失败: %v", sensorID, err)
+		return false
+	}
+	section, err := a.store.GetSection(ctx, sectionID)
+	if err != nil {
+		log.Printf("【分析-错误】获取断面[%d]信息失败: %v", sectionID, err)
+		return false
+	}
+
+	// 构造告警消息
+	var message string
+	switch state {
+	case model.SensorStateUnknown:
+		message = fmt.Sprintf(
+			"【%s】断面[%s](%s)传感器[%s](%s) 自部署以来从未上报数据，疑似设备未上线或接线故障",
+			level, section.Code, section.Name,
+			sensor.Code, sensor.Position,
+		)
+	case model.SensorStateOffline:
+		message = fmt.Sprintf(
+			"【%s】断面[%s](%s)传感器[%s](%s) 已 %d 分钟无数据上报，超过预期周期 %d 分钟，疑似设备离线或数据缺失",
+			level, section.Code, section.Name,
+			sensor.Code, sensor.Position,
+			mins, store.SensorExpectedIntervalMin,
+		)
+	default:
+		// 不会走到这里（stale 状态已在外层过滤）
+		return false
+	}
+
+	alert := &model.Alert{
+		SectionID:   sectionID,
+		SensorID:    sensorID,
+		Level:       level,
+		Type:        model.AlertTypeOffline,
+		Message:     message,
+		DeformationRate: 0,
+		Threshold:   float64(store.SensorExpectedIntervalMin),
+		Status:      model.AlertStatusActive,
+		TriggeredAt: time.Now(),
+	}
+
+	if err := a.store.InsertAlert(ctx, alert); err != nil {
+		log.Printf("【分析-错误】插入离线告警失败: %v", err)
+		return false
+	}
+
+	// 告警插入成功后，异步触发该断面的健康度评分重算
+	// （健康度的 completeness 维度会自动反映离线状态）
+	if a.health != nil {
+		a.health.EnqueueRecompute(sectionID)
+	}
+
+	log.Printf("【分析-告警】%s", message)
+
+	// 通过 WebSocket 推送给前端仪表盘
+	a.hub.BroadcastAlert(alert)
+	return true
+}
+
+// GetSensorsLivenessBySection 拉取某断面下所有传感器的存活状态
+// 用于前端在加载断面详情时一并展示"在线/离线"指示
+func (a *Analyzer) GetSensorsLivenessBySection(ctx context.Context, sectionID int) ([]model.SensorLiveness, error) {
+	sensors, err := a.store.GetSensorsBySection(ctx, sectionID)
+	if err != nil {
+		return nil, err
+	}
+	if len(sensors) == 0 {
+		return []model.SensorLiveness{}, nil
+	}
+	ids := make([]int, 0, len(sensors))
+	for _, s := range sensors {
+		ids = append(ids, s.ID)
+	}
+	lastDataMap, err := a.store.GetSensorsLastDataAt(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]model.SensorLiveness, 0, len(sensors))
+	for _, s := range sensors {
+		last := lastDataMap[s.ID]
+		state, mins := store.ComputeSensorState(last, now)
+		out = append(out, model.SensorLiveness{
+			SensorID:             s.ID,
+			SectionID:            s.SectionID,
+			LastDataAt:           last,
+			State:                state,
+			MinutesSinceLastData: mins,
+			ExpectedIntervalMin:  store.SensorExpectedIntervalMin,
+		})
+	}
+	return out, nil
 }
 
 // SetHealthScheduler 注入健康度调度器，告警插入后异步触发对应断面评分重算
