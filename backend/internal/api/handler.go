@@ -35,6 +35,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.GET("/sections/:id/sensors", h.GetSectionSensors)
 		api.GET("/sections/:id/realtime", h.GetSectionRealtimeData)
 		api.GET("/sections/:id/alerts", h.GetSectionAlerts)
+		// 概览用：批量拉取每个断面的"当前活跃告警数"
+		// 与详情页 /sections/:id/alerts?status=active 同口径（status='active'），
+		// 避免卡片红标与详情页活跃告警列表出现"3条/1条"这种不一致。
+		api.GET("/sections/active-alert-counts", h.GetSectionActiveAlertCounts)
 		// 存活感知：拉取某断面下所有传感器的在线状态
 		api.GET("/sections/:id/liveness", h.GetSectionLiveness)
 
@@ -254,6 +258,29 @@ func (h *Handler) GetSectionAlerts(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": alerts, "total": len(alerts)})
+}
+
+// GetSectionActiveAlertCounts 批量获取每个断面的"当前活跃告警数"
+//
+// 用途：首页"监测断面概览"卡片右下角"当前告警数"红标。
+// 与详情页 GetSectionAlerts(id, ..., 'active') 同口径——
+// 仅 status='active' 的告警被统计，已自动恢复/人工解决的告警不计。
+//
+// 返回：{ counts: { "1": 3, "2": 0, ... } }
+// 无活跃告警的断面不会出现在 counts 中，前端按 0 处理。
+func (h *Handler) GetSectionActiveAlertCounts(c *gin.Context) {
+	counts, err := h.store.CountActiveAlertsBySection(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// map[int]int 不能直接 JSON 序列化为 string key，前端用 Record<number, number> 接收
+	// 这里返回 map 形式，由 gin/encoding/json 按 numeric key 序列化即可
+	out := make(map[string]int, len(counts))
+	for id, n := range counts {
+		out[strconv.Itoa(id)] = n
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out, "total_sections": len(out)})
 }
 
 // GetSensor 获取传感器信息

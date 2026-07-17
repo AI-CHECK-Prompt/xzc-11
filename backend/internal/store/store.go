@@ -626,6 +626,35 @@ func (s *Store) ResolveAlert(ctx context.Context, alertID int) error {
 	return err
 }
 
+// CountActiveAlertsBySection 统计每个断面的当前活跃告警数（status='active'）
+//
+// 用途：首页"监测断面概览"卡片需要展示"当前告警数"小红标。
+// 必须与详情页 GetSectionAlerts(id, ..., 'active') 的口径保持一致——
+// 仅统计 status='active' 的告警，已自动恢复 / 人工解决的告警不计。
+//
+// 返回值：sectionID -> count。无活跃告警的断面不会出现在 map 中。
+// 性能：单条 GROUP BY 聚合，命中 idx_alerts_section / idx_alerts_status。
+func (s *Store) CountActiveAlertsBySection(ctx context.Context) (map[int]int, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT section_id, COUNT(*)::int
+		 FROM alerts
+		 WHERE status = 'active'
+		 GROUP BY section_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int]int)
+	for rows.Next() {
+		var sectionID, count int
+		if err := rows.Scan(&sectionID, &count); err != nil {
+			return nil, err
+		}
+		result[sectionID] = count
+	}
+	return result, rows.Err()
+}
+
 // AutoResolveAlerts 批量自动关闭告警（按 ID 列表）
 //
 // 用于自动恢复流程：定时任务判定"数据已恢复"后，调用本方法将

@@ -13,6 +13,12 @@ export const useMonitorStore = defineStore('monitor', () => {
   const sections = ref<Section[]>([])
   const activeAlerts = ref<Alert[]>([])
 
+  // 每个断面的"当前活跃告警数"：sectionId -> count
+  // 与详情页 /sections/:id/alerts?status=active 同口径（status='active'），
+  // 用于首页"监测断面概览"卡片右下角的"当前告警数"红标。
+  // 缺失的 sectionId 视作 0（该断面当前无活跃告警）。
+  const sectionActiveAlertCounts = ref<Record<number, number>>({})
+
   // 告警摘要
   const alertsSummary = computed(() => ({
     total: activeAlerts.value.length,
@@ -50,6 +56,24 @@ export const useMonitorStore = defineStore('monitor', () => {
     }
   }
 
+  // 拉取每个断面的"当前活跃告警数"
+  // 修复"断面卡片显示 3 条告警，进入详情只有 1 条"问题：
+  // 之前卡片若按 activeAlerts 自行按 section_id 聚合，会受 WS 推送/前端过滤影响
+  // 与详情页数据源产生偏差。改为统一调用后端聚合接口，详情页与卡片数据源完全一致。
+  async function fetchSectionActiveAlertCounts() {
+    try {
+      const data = await api.getSectionActiveAlertCounts()
+      // data 后端以 string key 返回（{ "1": 3 }），前端统一转 number key
+      const converted: Record<number, number> = {}
+      for (const [k, v] of Object.entries(data.data || {})) {
+        converted[Number(k)] = v
+      }
+      sectionActiveAlertCounts.value = converted
+    } catch (e) {
+      console.error('获取断面活跃告警数失败:', e)
+    }
+  }
+
   // WebSocket 连接
   function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -74,6 +98,9 @@ export const useMonitorStore = defineStore('monitor', () => {
             }
           }
           fetchOverview()
+          // 修复"卡片红标落后于实际活跃告警"问题：新增告警时立即刷新聚合数，
+          // 避免前端拿老 map 自增导致与服务端 status 过滤后口径不一致。
+          fetchSectionActiveAlertCounts()
         } else if (msg.type === 'alert_resolved') {
           // 告警已自动关闭（数据恢复正常），从活跃列表中移除并刷新概览
           const payload = msg.data as { alert_ids: number[]; count: number; source: string }
@@ -83,6 +110,8 @@ export const useMonitorStore = defineStore('monitor', () => {
             )
           }
           fetchOverview()
+          // 自动恢复 / 人工解决后，断面活跃告警数会减少，重新拉取保证一致
+          fetchSectionActiveAlertCounts()
         } else if (msg.type === 'data_update') {
           // 数据更新，刷新概览
           fetchOverview()
@@ -120,10 +149,12 @@ export const useMonitorStore = defineStore('monitor', () => {
     overview,
     sections,
     activeAlerts,
+    sectionActiveAlertCounts,
     alertsSummary,
     fetchOverview,
     fetchSections,
     fetchAlerts,
+    fetchSectionActiveAlertCounts,
     connectWebSocket,
     disconnectWebSocket,
   }

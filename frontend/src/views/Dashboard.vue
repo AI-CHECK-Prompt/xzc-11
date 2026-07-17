@@ -87,6 +87,28 @@
             <span class="sensor-badge">位移计</span>
             <span class="sensor-badge">应变计</span>
           </div>
+          <!--
+            当前告警数：右下角小红标
+            数据源与详情页"活跃告警"列表完全一致（status='active'），
+            不会出现"卡片 3 条/详情 1 条"或"卡片 0 条/详情 2 条"这种偏差。
+            0 条时灰色不抢眼，>0 条红色高亮。
+          -->
+          <div
+            v-if="getActiveAlertCount(section.id) > 0"
+            class="section-alert-badge danger"
+            :title="`该断面当前活跃告警 ${getActiveAlertCount(section.id)} 条`"
+          >
+            <span class="dot"></span>
+            {{ getActiveAlertCount(section.id) }}条告警
+          </div>
+          <div
+            v-else
+            class="section-alert-badge ok"
+            title="该断面当前无活跃告警"
+          >
+            <span class="dot"></span>
+            0条告警
+          </div>
         </router-link>
       </div>
     </div>
@@ -111,9 +133,18 @@ function formatTime(t: string) {
   return new Date(t).toLocaleString('zh-CN')
 }
 
+// 取某断面的"当前活跃告警数"
+// 与详情页 /sections/:id/alerts?status=active 同口径（status='active'），
+// 缺失 key 视为 0（该断面当前无活跃告警）。
+function getActiveAlertCount(sectionId: number): number {
+  return store.sectionActiveAlertCounts[sectionId] || 0
+}
+
 onMounted(() => {
   store.fetchOverview()
   store.fetchSections()
   store.fetchAlerts()
+  // 加载每断面的"当前活跃告警数"，供卡片右下角徽标使用
+  store.fetchSectionActiveAlertCounts()
 })
 </script>

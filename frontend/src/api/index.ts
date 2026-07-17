@@ -73,6 +73,18 @@ export async function getSectionAlerts(
   return data
 }
 
+// 获取每个断面的"当前活跃告警数"（用于首页"监测断面概览"卡片右下角红标）
+// 与详情页 /sections/:id/alerts?status=active 同口径（status='active'），
+// 避免卡片红标与详情页活跃告警列表出现"3条/1条"这种不一致。
+// 返回 Record<sectionId, count>；无活跃告警的断面不会出现在 data 中，前端按 0 处理。
+export async function getSectionActiveAlertCounts(): Promise<{
+  data: Record<string, number>
+  total_sections: number
+}> {
+  const { data } = await api.get('/sections/active-alert-counts')
+  return data
+}
+
 // 解决告警
 export async function resolveAlert(alertId: number) {
   const { data } = await api.put(`/alerts/${alertId}/resolve`)

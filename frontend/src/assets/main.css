@@ -208,6 +208,8 @@ body {
   cursor: pointer;
   transition: all 0.2s;
   border: 1px solid var(--border);
+  /* 相对定位，让右下角"当前告警数"红标基于卡片定位 */
+  position: relative;
 }
 
 .section-card:hover {
@@ -224,6 +226,48 @@ body {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* ============================================================ */
+/* 断面卡片"当前告警数"红/灰徽标                                  */
+/* 数据源与详情页 /sections/:id/alerts?status=active 一致         */
+/* ============================================================ */
+.section-alert-badge {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  line-height: 1.4;
+  /* 不阻挡卡片点击跳转 */
+  pointer-events: none;
+}
+.section-alert-badge .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.section-alert-badge.danger {
+  background: #fce8e6;
+  color: #c62828;
+}
+.section-alert-badge.danger .dot {
+  background: #db4437;
+  box-shadow: 0 0 0 2px rgba(219, 68, 55, 0.18);
+}
+.section-alert-badge.ok {
+  background: #f1f3f4;
+  color: var(--text-secondary);
+}
+.section-alert-badge.ok .dot {
+  background: #bdbdbd;
 }
 
 .sensor-badge {
