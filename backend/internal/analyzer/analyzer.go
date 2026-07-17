@@ -462,3 +462,139 @@ func (a *Analyzer) GetSensorsLivenessBySection(ctx context.Context, sectionID in
 func (a *Analyzer) SetHealthScheduler(s *healthscore.Scheduler) {
 	a.health = s
 }
+
+// AutoResolveRecoveredAlerts 自动关闭已恢复的告警
+//
+// 修复"告警数据已恢复但 active 状态长期留存"问题。
+// 定时任务每 5 分钟扫描所有 active 告警，对每条告警判定对应传感器的实时状态：
+//   - rate 类型    ：当前 24h 多窗口最严速率 |rate| 低于 warning 阈值 → 数据已恢复
+//   - offline 类型：最近一次上报在 10 分钟内（online 状态）→ 设备已恢复
+//   - 缺省 type    ：兼容历史数据，按 rate 规则判定
+//
+// 满足恢复条件的告警会批量更新为 resolved 状态。resolved 完成后通过
+// WebSocket 广播 "alert_resolved" 消息，前端可即时从活跃列表移除并刷新概览。
+//
+// 返回值：扫描告警数、关闭告警数、错误
+func (a *Analyzer) AutoResolveRecoveredAlerts(ctx context.Context) (int, int, error) {
+	startTime := time.Now()
+	activeAlerts, err := a.store.GetActiveAlerts(ctx)
+	if err != nil {
+		log.Printf("【分析-恢复-错误】查询活跃告警失败: %v", err)
+		return 0, 0, err
+	}
+	if len(activeAlerts) == 0 {
+		return 0, 0, nil
+	}
+
+	// 按 sensorID 缓存每台传感器的实时状态，避免同一传感器在多条告警上重复查询
+	type sensorState struct {
+		sensor   *model.Sensor
+		rate     *model.DeformationRate
+		rateErr  error
+		lastData *time.Time
+		lastErr  error
+	}
+	cache := make(map[int]*sensorState, len(activeAlerts))
+
+	toResolve := make([]int, 0, len(activeAlerts))
+	for _, alert := range activeAlerts {
+		ss, ok := cache[alert.SensorID]
+		if !ok {
+			sensor, err := a.store.GetSensor(ctx, alert.SensorID)
+			if err != nil {
+				log.Printf("【分析-恢复-错误】获取传感器[%d]信息失败: %v", alert.SensorID, err)
+				continue
+			}
+			ss = &sensorState{sensor: sensor}
+			cache[alert.SensorID] = ss
+		}
+
+		recovered := false
+		// 历史告警可能没有 type 字段，按 rate 规则兼容处理
+		alertType := alert.Type
+		if alertType == "" {
+			alertType = model.AlertTypeRate
+		}
+
+		switch alertType {
+		case model.AlertTypeRate:
+			// rate 类告警：实时计算 24h 速率
+			if ss.rate == nil && ss.rateErr == nil {
+				rate, rerr := a.store.CalculateDeformationRate(ctx, ss.sensor.ID)
+				ss.rate, ss.rateErr = rate, rerr
+			}
+			if ss.rateErr != nil {
+				// 数据不足（采集器刚部署 / 数据未恢复） → 暂不判定为恢复
+				log.Printf("【分析-恢复-跳过】传感器[%d] 24h数据不足: %v", ss.sensor.ID, ss.rateErr)
+				continue
+			}
+			if !exceedsWarningThreshold(ss.sensor.Type, math.Abs(ss.rate.Rate), a.threshold) {
+				recovered = true
+			}
+		case model.AlertTypeOffline:
+			// offline 类告警：检查最近一次上报时间
+			if ss.lastData == nil && ss.lastErr == nil {
+				ts, lerr := a.store.GetSensorLastDataAt(ctx, ss.sensor.ID)
+				ss.lastData, ss.lastErr = ts, lerr
+			}
+			if ss.lastErr != nil {
+				log.Printf("【分析-恢复-错误】获取传感器[%d]最近上报时间失败: %v", ss.sensor.ID, ss.lastErr)
+				continue
+			}
+			// 仅当最近一次上报 < 10 分钟（online 状态）才判定恢复
+			if ss.lastData != nil {
+				_, mins := store.ComputeSensorState(ss.lastData, time.Now())
+				if mins >= 0 && mins < int(store.SensorOnlineThreshold.Minutes()) {
+					recovered = true
+				}
+			}
+		}
+
+		if recovered {
+			toResolve = append(toResolve, alert.ID)
+		}
+	}
+
+	if len(toResolve) == 0 {
+		log.Printf("【分析-恢复】扫描active告警=%d，已恢复=0 耗时=%v", len(activeAlerts), time.Since(startTime))
+		return len(activeAlerts), 0, nil
+	}
+
+	closed, err := a.store.AutoResolveAlerts(ctx, toResolve)
+	if err != nil {
+		log.Printf("【分析-恢复-错误】批量关闭告警失败: %v", err)
+		return len(activeAlerts), 0, err
+	}
+
+	log.Printf("【分析-恢复】扫描active告警=%d，待关闭=%d，已成功关闭=%d 耗时=%v",
+		len(activeAlerts), len(toResolve), closed, time.Since(startTime))
+
+	// 通过 WebSocket 广播告警已自动恢复，前端可即时从活跃列表移除
+	if a.hub != nil && closed > 0 {
+		a.hub.BroadcastAlertsResolved(toResolve, closed)
+	}
+
+	return len(activeAlerts), closed, nil
+}
+
+// exceedsWarningThreshold 判断绝对速率是否达到指定传感器类型的告警 warning 阈值
+// 抽出为纯函数便于单元测试覆盖各传感器类型
+//
+// 设计要点：
+//   - 与 analyzeSensor 内的告警判定逻辑保持完全一致：
+//     absRate >= warningThreshold 即认为需要告警
+//   - 未知传感器类型返回 false（保守地不恢复）
+func exceedsWarningThreshold(sensorType model.SensorType, absRate float64, t Threshold) bool {
+	var warningThreshold float64
+	switch sensorType {
+	case model.SensorTypeCrack:
+		warningThreshold = t.CrackRateWarning
+	case model.SensorTypeDisplacement:
+		warningThreshold = t.DisplacementRateWarning
+	case model.SensorTypeStrain:
+		warningThreshold = t.StrainRateWarning
+	default:
+		return false
+	}
+	return absRate >= warningThreshold
+}

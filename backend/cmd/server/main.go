@@ -122,7 +122,8 @@ func main() {
 	// 定时任务：
 	//   - 速率告警分析：每 5 分钟的整 5 分钟位（xx:00, xx:05, xx:10...）执行
 	//   - 存活感知扫描：每 5 分钟的整 10 分钟位（xx:00, xx:10, xx:20...）执行
-	// 两个任务错开 2~3 分钟，避免同一时刻大量 SQL 抢占连接池
+	//   - 告警自动恢复：每 5 分钟的整 4 分钟位（xx:04, xx:09, xx:14...）执行
+	// 三个任务错开 2~4 分钟，避免同一时刻大量 SQL 抢占连接池
 	c := cron.New()
 	c.AddFunc("*/5 * * * *", func() {
 		anal.AnalyzeAllSensors(context.Background())
@@ -132,9 +133,15 @@ func main() {
 		// 与速率告警分析（0/5/10/15/...）错开至少 2 分钟
 		anal.DetectOfflineSensors(context.Background())
 	})
+	c.AddFunc("4-59/5 * * * *", func() {
+		// 4/9/14/19/24/29/34/39/44/49/54/59 分触发
+		// 与上述两个任务错开 2~4 分钟
+		anal.AutoResolveRecoveredAlerts(context.Background())
+	})
 	c.Start()
 	log.Println("【系统-定时】告警分析定时任务已启动（每5分钟错峰）")
 	log.Println("【系统-定时】存活感知定时任务已启动（每5分钟错峰）")
+	log.Println("【系统-定时】告警自动恢复定时任务已启动（每5分钟错峰）")
 
 	// 启动HTTP服务
 	srv := &http.Server{

@@ -128,6 +128,43 @@ func (h *Hub) BroadcastAlert(alert *model.Alert) {
 	h.broadcast <- jsonData
 }
 
+// BroadcastAlertsResolved 广播告警已自动恢复
+//
+// 修复"告警长期停留在 active 状态"问题后，定时任务批量关闭的告警
+// 需要通过 WebSocket 通知前端。前端收到此消息后，可从 activeAlerts
+// 列表中按 ID 移除对应条目，并触发 dashboard 概览刷新。
+//
+// payload 设计：
+//   - alert_ids  : 被关闭的告警 ID 列表（与 SQL 实际 UPDATE 行数一致）
+//   - count      : 关闭总数（前端兜底校验用）
+//   - source     : 触发来源标识（auto=自动恢复；前端可基于此区分"自动"与"人工"）
+type AlertsResolvedPayload struct {
+	AlertIDs []int  `json:"alert_ids"`
+	Count    int    `json:"count"`
+	Source   string `json:"source"`
+}
+
+func (h *Hub) BroadcastAlertsResolved(alertIDs []int, count int) {
+	if len(alertIDs) == 0 || count == 0 {
+		return
+	}
+	msg := Message{
+		Type: "alert_resolved",
+		Data: AlertsResolvedPayload{
+			AlertIDs: alertIDs,
+			Count:    count,
+			Source:   "auto",
+		},
+		Timestamp: time.Now(),
+	}
+	jsonData, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("【WS-错误】序列化告警恢复消息失败: %v", err)
+		return
+	}
+	h.broadcast <- jsonData
+}
+
 // NewClient 创建客户端
 func NewClient(conn *websocket.Conn, hub *Hub) *Client {
 	return &Client{

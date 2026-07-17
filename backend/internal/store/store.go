@@ -626,6 +626,28 @@ func (s *Store) ResolveAlert(ctx context.Context, alertID int) error {
 	return err
 }
 
+// AutoResolveAlerts 批量自动关闭告警（按 ID 列表）
+//
+// 用于自动恢复流程：定时任务判定"数据已恢复"后，调用本方法将
+// 一批 active 告警一次性更新为 resolved。更新条件带 status='active' 兜底，
+// 避免重复关闭同一告警（若两次定时任务并发执行，后执行的将是 0 行更新）。
+//
+// 返回值：成功关闭的告警条数（用于上层统计）
+func (s *Store) AutoResolveAlerts(ctx context.Context, alertIDs []int) (int, error) {
+	if len(alertIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE alerts
+		 SET status = 'resolved', resolved_at = NOW()
+		 WHERE status = 'active' AND id = ANY($1)`,
+		alertIDs)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // GetSections 获取所有断面
 func (s *Store) GetSections(ctx context.Context) ([]model.Section, error) {
 	rows, err := s.pool.Query(ctx,

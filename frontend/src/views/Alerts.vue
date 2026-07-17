@@ -40,10 +40,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
+import { storeToRefs } from 'pinia'
+import { useMonitorStore } from '../stores/monitor'
 import * as api from '../api'
 
-const alerts = ref<Alert[]>([])
+const store = useMonitorStore()
+const { activeAlerts } = storeToRefs(store)
+
+// 复用全局 monitor store 中的活跃告警列表，自动接收 WS 推送的"自动恢复"事件
+const alerts = computed<Alert[]>(() => activeAlerts.value)
 
 const dangerCount = computed(() => alerts.value.filter(a => a.level === 'danger').length)
 const warningCount = computed(() => alerts.value.filter(a => a.level === 'warning').length)
@@ -55,8 +61,9 @@ function formatTime(t: string) {
 async function handleResolve(alert: Alert) {
   try {
     await api.resolveAlert(alert.id)
-    alert.status = 'resolved'
-    alert.resolved_at = new Date().toISOString()
+    // 从 store 中移除（与后端"自动恢复"WS 推送行为保持一致）
+    store.activeAlerts = store.activeAlerts.filter(a => a.id !== alert.id)
+    store.fetchOverview()
   } catch (e) {
     console.error('解决告警失败:', e)
   }
@@ -64,8 +71,7 @@ async function handleResolve(alert: Alert) {
 
 onMounted(async () => {
   try {
-    const data = await api.getActiveAlerts()
-    alerts.value = data.data || []
+    await store.fetchAlerts()
   } catch (e) {
     console.error('获取告警列表失败:', e)
   }

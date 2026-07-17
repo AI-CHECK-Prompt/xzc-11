@@ -74,6 +74,15 @@ export const useMonitorStore = defineStore('monitor', () => {
             }
           }
           fetchOverview()
+        } else if (msg.type === 'alert_resolved') {
+          // 告警已自动关闭（数据恢复正常），从活跃列表中移除并刷新概览
+          const payload = msg.data as { alert_ids: number[]; count: number; source: string }
+          if (payload?.alert_ids?.length) {
+            activeAlerts.value = activeAlerts.value.filter(
+              a => !payload.alert_ids.includes(a.id)
+            )
+          }
+          fetchOverview()
         } else if (msg.type === 'data_update') {
           // 数据更新，刷新概览
           fetchOverview()

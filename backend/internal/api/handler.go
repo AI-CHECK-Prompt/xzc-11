@@ -57,6 +57,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.POST("/debug/sections/:id/analyze", h.AnalyzeSectionForTest)
 		// 调试用：立刻执行全量存活感知扫描
 		api.POST("/debug/detect-offline", h.DebugDetectOffline)
+		// 调试用：立刻执行告警自动恢复扫描
+		api.POST("/debug/auto-resolve-alerts", h.DebugAutoResolveAlerts)
 	}
 }
 
@@ -112,6 +114,27 @@ func (h *Handler) DebugDetectOffline(c *gin.Context) {
 	}
 	h.analyzer.DetectOfflineSensors(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+}
+
+// DebugAutoResolveAlerts 调试用：立刻执行告警自动恢复扫描
+//
+// 验收/测试场景：告警数据已恢复正常后，调用本接口立刻检查并自动关闭，
+// 不必等待 5 分钟 cron。生产环境慎用——会与 cron 同时抢占 DB 连接。
+func (h *Handler) DebugAutoResolveAlerts(c *gin.Context) {
+	if h.analyzer == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "analyzer 未注入"})
+		return
+	}
+	scanned, closed, err := h.analyzer.AutoResolveRecoveredAlerts(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "ok",
+		"scanned_alerts":  scanned,
+		"resolved_alerts": closed,
+	})
 }
 
 // GetSections 获取所有断面
