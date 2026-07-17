@@ -315,13 +315,33 @@ func (s *Store) GetHistoricalData(ctx context.Context, sensorID int, start, end 
 }
 
 // GetHistoricalDataAggregated 获取聚合后的历史数据（用于趋势图）
+//
+// 修复"阶梯状跳变"bug：原实现使用 time_bucket(interval, timestamp) 3 参数版本，
+// 对齐到 1970-01-01 00:00:00 UTC + N*interval（UTC 整点）。当查询区间超过 24h
+// 且使用按小时聚合时，bucket 边界（UTC 整点）会与 sensor_data 实际数据点
+// （simulator 启动时刻 + N*60s，与 UTC 整点不对齐）产生 23m45s 量级的偏差，
+// 导致：
+//   1) 第一个 bucket 实际只覆盖 23m45s ~ 59m59s（样本数 37），样本不足；
+//   2) 最后一个 bucket 同样只覆盖 00m00s ~ 23m45s（样本数 24），样本不足；
+//   3) 中间每个整点 bucket 边界与数据点不对齐，使得前端曲线呈现
+//      "每隔一个点突然跳到几小时前的值再缓慢爬升"的阶梯状错位感；
+//   4) 当前端 labels 用 toLocaleString('zh-CN') 格式化 bucket 起点后，
+//      错位的 bucket 时间戳会让用户误读趋势。
+//
+// 修复方案：使用 time_bucket 4 参数版本，把查询区间的 start 作为 origin。
+// 这样 bucket 起点 = start + N*interval，与 sensor_data 实际数据点严格对齐，
+// 每个完整 bucket 都恰好覆盖 60 条 60s 周期的连续样本，AVG 曲线恢复平滑，
+// 与 sensor_data 真实漂移趋势一致。
+//
+// 注意：origin 取自 $2（即 WHERE 条件中的 start），保证 bucket 边界与
+// 查询窗口严格对齐，不会因 UTC 整点偏移产生累积偏差。
 func (s *Store) GetHistoricalDataAggregated(ctx context.Context, sensorID int, start, end time.Time, interval string) ([]model.SensorData, error) {
 	query := fmt.Sprintf(
 		`SELECT
 			MIN(id) as id,
 			sensor_id,
 			AVG(value) as value,
-			time_bucket('%s', timestamp) as bucket
+			time_bucket('%s'::interval, timestamp, $2) as bucket
 		 FROM sensor_data
 		 WHERE sensor_id = $1 AND timestamp >= $2 AND timestamp <= $3
 		 GROUP BY bucket, sensor_id
@@ -1088,9 +1108,14 @@ func (s *Store) GetLatestSectionHealthScore(ctx context.Context, sectionID int) 
 }
 
 // GetHealthScoreHistoryAggregated 获取历史评分曲线（按 interval 聚合）
+//
+// 修复"阶梯状跳变"bug：与 GetHistoricalDataAggregated 同根因——
+// 3 参数 time_bucket 对齐到 1970-01-01 00:00:00 UTC + N*interval，
+// 与评分实际计算时刻（cron 触发，非整点）对齐错位。改用 4 参数版本，
+// 把查询区间 start 作为 origin，保证 bucket 边界与评分时间点对齐。
 func (s *Store) GetHealthScoreHistoryAggregated(ctx context.Context, sectionID int, start, end time.Time, interval string) ([]HistoryPoint, error) {
 	q := fmt.Sprintf(`
-		SELECT time_bucket('%s', calculated_at) AS bucket,
+		SELECT time_bucket('%s'::interval, calculated_at, $2) AS bucket,
 		       AVG(total_score)::double precision AS avg_score,
 		       MIN(total_score)::double precision AS min_score,
 		       MAX(total_score)::double precision AS max_score,
