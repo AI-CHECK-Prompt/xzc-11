@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"tunnel-shm/internal/analyzer"
 	"tunnel-shm/internal/model"
 	"tunnel-shm/internal/store"
 
@@ -12,16 +13,19 @@ import (
 
 // Handler API处理器
 type Handler struct {
-	store *store.Store
+	store    *store.Store
+	engine   *gin.Engine
+	analyzer *analyzer.Analyzer
 }
 
 // NewHandler 创建API处理器
-func NewHandler(store *store.Store) *Handler {
-	return &Handler{store: store}
+func NewHandler(store *store.Store, engine *gin.Engine, anal *analyzer.Analyzer) *Handler {
+	return &Handler{store: store, engine: engine, analyzer: anal}
 }
 
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	h.engine = r
 	api := r.Group("/api/v1")
 	{
 		// 断面相关
@@ -43,6 +47,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 		// 概览统计
 		api.GET("/dashboard/overview", h.GetDashboardOverview)
+
+		// 调试用：立刻分析某断面的所有传感器（验收脚本使用）
+		api.POST("/debug/sections/:id/analyze", h.AnalyzeSectionForTest)
 	}
 }
 
@@ -108,7 +115,7 @@ func (h *Handler) GetSectionRealtimeData(c *gin.Context) {
 		return
 	}
 
-	alerts, _ := h.store.GetSectionAlerts(c.Request.Context(), id, 5, model.AlertStatusActive)
+	alerts, _ := h.store.GetSectionAlerts(c.Request.Context(), id, 5, string(model.AlertStatusActive))
 
 	dataMap := make(map[int]interface{})
 	for _, d := range latestData {
@@ -306,5 +313,23 @@ func (h *Handler) GetDashboardOverview(c *gin.Context) {
 		"warning_alerts": warningCount,
 		"active_alerts":  len(alerts),
 	})
+}
+
+// AnalyzeSectionForTest 触发某断面的全量告警分析（绕过 5 分钟 cron）
+//
+// 验收脚本 / 联调用：上传异常数据后立刻调用本接口，可以快速验证
+// "连续 3 次告警 → 评分下降" 的链路。
+func (h *Handler) AnalyzeSectionForTest(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的断面ID"})
+		return
+	}
+	if h.analyzer == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "analyzer 未注入"})
+		return
+	}
+	h.analyzer.AnalyzeSectionByID(c.Request.Context(), id)
+	c.JSON(http.StatusOK, gin.H{"message": "ok", "section_id": id})
 }
 

@@ -99,3 +99,82 @@ BEGIN
         ON CONFLICT (code) DO NOTHING;
     END LOOP;
 END $$;
+
+-- ============================================
+-- 断面健康度评估（追加 schema，向后兼容）
+-- ============================================
+
+-- 断面位置特性（追加列，向后兼容，缺省 'mid'）
+ALTER TABLE sections ADD COLUMN IF NOT EXISTS position_type VARCHAR(20) NOT NULL DEFAULT 'mid';
+CREATE INDEX IF NOT EXISTS idx_sections_position_type ON sections (position_type);
+
+-- 健康度最新评分表
+CREATE TABLE IF NOT EXISTS section_health_scores (
+    id SERIAL,
+    section_id INTEGER NOT NULL REFERENCES sections(id),
+    total_score DOUBLE PRECISION NOT NULL,
+    grade VARCHAR(20) NOT NULL,
+    displacement_score DOUBLE PRECISION NOT NULL,
+    crack_score DOUBLE PRECISION NOT NULL,
+    strain_score DOUBLE PRECISION NOT NULL,
+    alert_dimension_score DOUBLE PRECISION NOT NULL,
+    trend_dimension_score DOUBLE PRECISION NOT NULL,
+    stability_dimension_score DOUBLE PRECISION NOT NULL,
+    completeness_dimension_score DOUBLE PRECISION NOT NULL,
+    position_type VARCHAR(20) NOT NULL,
+    sensitivity DOUBLE PRECISION NOT NULL,
+    trigger_type VARCHAR(20) NOT NULL,
+    calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (id, calculated_at)
+);
+SELECT create_hypertable('section_health_scores', 'calculated_at', if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '30 days');
+CREATE INDEX IF NOT EXISTS idx_shs_section_time ON section_health_scores (section_id, calculated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shs_grade_time ON section_health_scores (grade, calculated_at DESC);
+
+-- 评分明细表（可解释）
+CREATE TABLE IF NOT EXISTS section_health_score_details (
+    id SERIAL,
+    score_id BIGINT NOT NULL,
+    section_id INTEGER NOT NULL,
+    dimension VARCHAR(40) NOT NULL,
+    sub_dimension VARCHAR(60) NOT NULL DEFAULT '',
+    raw_value DOUBLE PRECISION NOT NULL,
+    sub_score DOUBLE PRECISION NOT NULL,
+    weight DOUBLE PRECISION NOT NULL,
+    contribution DOUBLE PRECISION NOT NULL,
+    explanation TEXT NOT NULL,
+    calculated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (id, calculated_at)
+);
+SELECT create_hypertable('section_health_score_details', 'calculated_at', if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '30 days');
+CREATE INDEX IF NOT EXISTS idx_shsd_score ON section_health_score_details (score_id, calculated_at DESC);
+
+-- 复核中间数据表
+CREATE TABLE IF NOT EXISTS section_health_score_intermediate (
+    id SERIAL,
+    score_id BIGINT NOT NULL,
+    section_id INTEGER NOT NULL,
+    sensor_id INTEGER NOT NULL,
+    sensor_type VARCHAR(20) NOT NULL,
+    rate_24h DOUBLE PRECISION NOT NULL,
+    rate_7d DOUBLE PRECISION NOT NULL,
+    rate_30d DOUBLE PRECISION NOT NULL,
+    recent_alert_count INTEGER NOT NULL,
+    data_completeness DOUBLE PRECISION NOT NULL,
+    historical_variance DOUBLE PRECISION NOT NULL,
+    sensor_sub_score DOUBLE PRECISION NOT NULL,
+    inputs_json TEXT NOT NULL,
+    calculated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (id, calculated_at)
+);
+SELECT create_hypertable('section_health_score_intermediate', 'calculated_at', if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '30 days');
+CREATE INDEX IF NOT EXISTS idx_shsi_score ON section_health_score_intermediate (score_id, calculated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shsi_section_sensor ON section_health_score_intermediate (section_id, sensor_id, calculated_at DESC);
+
+-- 3 年数据保留策略
+SELECT add_retention_policy('section_health_scores', INTERVAL '3 years', if_not_exists => TRUE);
+SELECT add_retention_policy('section_health_score_details', INTERVAL '3 years', if_not_exists => TRUE);
+SELECT add_retention_policy('section_health_score_intermediate', INTERVAL '3 years', if_not_exists => TRUE);

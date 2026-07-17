@@ -9,9 +9,14 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 )
 
+// 修正：原依赖 github.com/chenzhuoyu/base64x 的 fe3a3abb8f00 revision 已从上游删除，
+// 用可用的最新 revision 替换，避免 go mod download 失败。
+replace github.com/chenzhuoyu/base64x => github.com/chenzhuoyu/base64x v0.0.0-20230717121745-296ad89f973d
+
 require (
-	github.com/bytedance/sonic v1.9.1 // indirect
+	github.com/bytedance/sonic v1.10.0-rc // indirect
 	github.com/chenzhuoyu/base64x v0.0.0-20221115062448-fe3a3abb8f00 // indirect
+	github.com/chenzhuoyu/iasm v0.9.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.2 // indirect
 	github.com/gin-contrib/sse v0.1.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
@@ -25,7 +30,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.4 // indirect
 	github.com/leodido/go-urn v1.2.4 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
-	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/pelletier/go-toml/v2 v2.0.8 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect

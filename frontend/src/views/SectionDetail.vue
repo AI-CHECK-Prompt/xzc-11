@@ -10,11 +10,18 @@
     <div v-else>
       <!-- 断面信息 -->
       <div class="card">
-        <div style="display:flex; gap:40px; font-size:13px; color:var(--text-secondary);">
+        <div style="display:flex; gap:40px; font-size:13px; color:var(--text-secondary); flex-wrap:wrap; align-items:center;">
           <span>编号: {{ section?.code }}</span>
           <span>线路: {{ section?.line_code }}号线</span>
           <span>里程: {{ section?.station_km }}m</span>
           <span>描述: {{ section?.description }}</span>
+          <span style="margin-left:auto;">
+            <router-link
+              :to="`/sections/${sectionId}/health`"
+              class="btn btn-primary btn-sm"
+              style="text-decoration:none;"
+            >查看健康度详情</router-link>
+          </span>
         </div>
       </div>
 

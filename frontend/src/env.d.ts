@@ -99,3 +99,99 @@ interface WSMessage {
   data: any
   timestamp: string
 }
+
+// 健康度评分相关类型
+type HealthGrade = 'excellent' | 'normal' | 'attention' | 'degraded' | 'danger'
+
+interface SectionHealthRankItem {
+  section_id: number
+  section_code: string
+  section_name: string
+  line_code: string
+  position_type: string
+  total_score: number
+  grade: HealthGrade
+  displacement_score: number
+  crack_score: number
+  strain_score: number
+  alert_dimension_score: number
+  trend_dimension_score: number
+  stability_dimension_score: number
+  completeness_dimension_score: number
+  sensitivity: number
+  trigger_type: string
+  calculated_at: string
+  recent_alert_count: number
+  prev_score?: number
+  score_trend?: number
+}
+
+interface HealthRankResponse {
+  data: SectionHealthRankItem[]
+  total: number
+  grade_count: Record<HealthGrade, number>
+  line_code: string
+}
+
+interface HealthScoreDetail {
+  dimension: string
+  sub_dimension: string
+  raw_value: number
+  sub_score: number
+  weight: number
+  contribution: number
+  explanation: string
+}
+
+interface HealthScoreIntermediate {
+  sensor_id: number
+  sensor_type: 'displacement' | 'crack' | 'strain'
+  rate_24h: number
+  rate_7d: number
+  rate_30d: number
+  recent_alert_count: number
+  data_completeness: number
+  historical_variance: number
+  sensor_sub_score: number
+  inputs_json: string
+}
+
+interface SectionHealthLatest {
+  id: number
+  section_id: number
+  total_score: number
+  grade: HealthGrade
+  displacement_score: number
+  crack_score: number
+  strain_score: number
+  alert_dimension_score: number
+  trend_dimension_score: number
+  stability_dimension_score: number
+  completeness_dimension_score: number
+  position_type: string
+  sensitivity: number
+  trigger_type: string
+  calculated_at: string
+}
+
+interface SectionHealthResponse {
+  score: SectionHealthLatest
+  details: HealthScoreDetail[]
+  intermediate: HealthScoreIntermediate[]
+}
+
+interface HealthHistoryPoint {
+  bucket: string
+  avg_score: number
+  min_score: number
+  max_score: number
+  samples: number
+}
+
+interface HealthHistoryResponse {
+  data: HealthHistoryPoint[]
+  total: number
+  interval: string
+  start: string
+  end: string
+}

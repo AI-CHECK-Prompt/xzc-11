@@ -115,6 +115,81 @@ func (s *Store) InitSchema(ctx context.Context) error {
 
 	-- 数据保留策略：自动删除3年前的数据
 	SELECT add_retention_policy('sensor_data', INTERVAL '3 years', if_not_exists => TRUE);
+
+	-- 断面位置特性（追加列，向后兼容，缺省 'mid'）
+	ALTER TABLE sections ADD COLUMN IF NOT EXISTS position_type VARCHAR(20) NOT NULL DEFAULT 'mid';
+	CREATE INDEX IF NOT EXISTS idx_sections_position_type ON sections (position_type);
+
+	-- 健康度最新评分表
+	CREATE TABLE IF NOT EXISTS section_health_scores (
+		id SERIAL,
+		section_id INTEGER NOT NULL REFERENCES sections(id),
+		total_score DOUBLE PRECISION NOT NULL,
+		grade VARCHAR(20) NOT NULL,
+		displacement_score DOUBLE PRECISION NOT NULL,
+		crack_score DOUBLE PRECISION NOT NULL,
+		strain_score DOUBLE PRECISION NOT NULL,
+		alert_dimension_score DOUBLE PRECISION NOT NULL,
+		trend_dimension_score DOUBLE PRECISION NOT NULL,
+		stability_dimension_score DOUBLE PRECISION NOT NULL,
+		completeness_dimension_score DOUBLE PRECISION NOT NULL,
+		position_type VARCHAR(20) NOT NULL,
+		sensitivity DOUBLE PRECISION NOT NULL,
+		trigger_type VARCHAR(20) NOT NULL,
+		calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (id, calculated_at)
+	);
+	SELECT create_hypertable('section_health_scores', 'calculated_at', if_not_exists => TRUE,
+		chunk_time_interval => INTERVAL '30 days');
+	CREATE INDEX IF NOT EXISTS idx_shs_section_time ON section_health_scores (section_id, calculated_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_shs_grade_time ON section_health_scores (grade, calculated_at DESC);
+
+	-- 评分明细表
+	CREATE TABLE IF NOT EXISTS section_health_score_details (
+		id SERIAL,
+		score_id BIGINT NOT NULL,
+		section_id INTEGER NOT NULL,
+		dimension VARCHAR(40) NOT NULL,
+		sub_dimension VARCHAR(60) NOT NULL DEFAULT '',
+		raw_value DOUBLE PRECISION NOT NULL,
+		sub_score DOUBLE PRECISION NOT NULL,
+		weight DOUBLE PRECISION NOT NULL,
+		contribution DOUBLE PRECISION NOT NULL,
+		explanation TEXT NOT NULL,
+		calculated_at TIMESTAMPTZ NOT NULL,
+		PRIMARY KEY (id, calculated_at)
+	);
+	SELECT create_hypertable('section_health_score_details', 'calculated_at', if_not_exists => TRUE,
+		chunk_time_interval => INTERVAL '30 days');
+	CREATE INDEX IF NOT EXISTS idx_shsd_score ON section_health_score_details (score_id, calculated_at DESC);
+
+	-- 复核中间数据表
+	CREATE TABLE IF NOT EXISTS section_health_score_intermediate (
+		id SERIAL,
+		score_id BIGINT NOT NULL,
+		section_id INTEGER NOT NULL,
+		sensor_id INTEGER NOT NULL,
+		sensor_type VARCHAR(20) NOT NULL,
+		rate_24h DOUBLE PRECISION NOT NULL,
+		rate_7d DOUBLE PRECISION NOT NULL,
+		rate_30d DOUBLE PRECISION NOT NULL,
+		recent_alert_count INTEGER NOT NULL,
+		data_completeness DOUBLE PRECISION NOT NULL,
+		historical_variance DOUBLE PRECISION NOT NULL,
+		sensor_sub_score DOUBLE PRECISION NOT NULL,
+		inputs_json TEXT NOT NULL,
+		calculated_at TIMESTAMPTZ NOT NULL,
+		PRIMARY KEY (id, calculated_at)
+	);
+	SELECT create_hypertable('section_health_score_intermediate', 'calculated_at', if_not_exists => TRUE,
+		chunk_time_interval => INTERVAL '30 days');
+	CREATE INDEX IF NOT EXISTS idx_shsi_score ON section_health_score_intermediate (score_id, calculated_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_shsi_section_sensor ON section_health_score_intermediate (section_id, sensor_id, calculated_at DESC);
+
+	-- 3 年数据保留策略
+	SELECT add_retention_policy('section_health_scores', INTERVAL '3 years', if_not_exists => TRUE);
+	SELECT add_retention_policy('section_health_score_details', INTERVAL '3 years', if_not_exists => TRUE);
+	SELECT add_retention_policy('section_health_score_intermediate', INTERVAL '3 years', if_not_exists => TRUE);
 	`
 	_, err := s.pool.Exec(ctx, schema)
 	return err
@@ -499,7 +574,7 @@ func (s *Store) ResolveAlert(ctx context.Context, alertID int) error {
 // GetSections 获取所有断面
 func (s *Store) GetSections(ctx context.Context) ([]model.Section, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, code, name, line_code, station_km, description, location_lat, location_lng
+		`SELECT id, code, name, line_code, station_km, description, location_lat, location_lng, position_type
 		 FROM sections ORDER BY station_km ASC`)
 	if err != nil {
 		return nil, err
@@ -510,7 +585,7 @@ func (s *Store) GetSections(ctx context.Context) ([]model.Section, error) {
 	for rows.Next() {
 		var sec model.Section
 		if err := rows.Scan(&sec.ID, &sec.Code, &sec.Name, &sec.LineCode,
-			&sec.StationKm, &sec.Description, &sec.LocationLat, &sec.LocationLng); err != nil {
+			&sec.StationKm, &sec.Description, &sec.LocationLat, &sec.LocationLng, &sec.PositionType); err != nil {
 			return nil, err
 		}
 		sections = append(sections, sec)
@@ -521,12 +596,12 @@ func (s *Store) GetSections(ctx context.Context) ([]model.Section, error) {
 // GetSection 获取单个断面
 func (s *Store) GetSection(ctx context.Context, id int) (*model.Section, error) {
 	row := s.pool.QueryRow(ctx,
-		`SELECT id, code, name, line_code, station_km, description, location_lat, location_lng
+		`SELECT id, code, name, line_code, station_km, description, location_lat, location_lng, position_type
 		 FROM sections WHERE id = $1`, id)
 
 	var sec model.Section
 	err := row.Scan(&sec.ID, &sec.Code, &sec.Name, &sec.LineCode,
-		&sec.StationKm, &sec.Description, &sec.LocationLat, &sec.LocationLng)
+		&sec.StationKm, &sec.Description, &sec.LocationLat, &sec.LocationLng, &sec.PositionType)
 	if err != nil {
 		return nil, err
 	}
@@ -635,4 +710,317 @@ func (s *Store) CheckRecentAlert(ctx context.Context, sensorID int, level model.
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// ===========================================
+// 健康度评分相关查询与写入
+// ===========================================
+
+// HistoryPoint 历史曲线的一个时间点
+// 与前端 HealthHistoryPoint 字段对齐：avg_score / min_score / max_score / samples
+type HistoryPoint struct {
+	Bucket   time.Time `json:"bucket"`
+	AvgScore float64   `json:"avg_score"`
+	MinScore float64   `json:"min_score"`
+	MaxScore float64   `json:"max_score"`
+	Samples  int       `json:"samples"`
+}
+
+// RankItem 健康度排名条目（看板用）
+// 字段与前端 SectionHealthRankItem 一一对应
+type RankItem struct {
+	SectionID                  int     `json:"section_id"`
+	SectionCode                string  `json:"section_code"`
+	SectionName                string  `json:"section_name"`
+	LineCode                   string  `json:"line_code"`
+	PositionType               string  `json:"position_type"`
+	TotalScore                 float64 `json:"total_score"`
+	Grade                      string  `json:"grade"`
+	DisplacementScore          float64 `json:"displacement_score"`
+	CrackScore                 float64 `json:"crack_score"`
+	StrainScore                float64 `json:"strain_score"`
+	AlertDimensionScore        float64 `json:"alert_dimension_score"`
+	TrendDimensionScore        float64 `json:"trend_dimension_score"`
+	StabilityDimensionScore    float64 `json:"stability_dimension_score"`
+	CompletenessDimensionScore float64 `json:"completeness_dimension_score"`
+	Sensitivity                float64 `json:"sensitivity"`
+	TriggerType                string  `json:"trigger_type"`
+	CalculatedAt               time.Time `json:"calculated_at"`
+	RecentAlertCount           int     `json:"recent_alert_count"`
+	PrevScore                  float64 `json:"prev_score"`
+	ScoreTrend                 float64 `json:"score_trend"`
+}
+
+// GetSectionAlertsSince 断面自 since 起的告警计数
+func (s *Store) GetSectionAlertsSince(ctx context.Context, sectionID int, since time.Time) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM alerts WHERE section_id = $1 AND triggered_at >= $2`,
+		sectionID, since).Scan(&count)
+	return count, err
+}
+
+// GetSensorDataRange 拉取指定区间数据（用于计算 7d/30d 速率与方差）
+func (s *Store) GetSensorDataRange(ctx context.Context, sensorID int, start, end time.Time) ([]model.SensorData, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, sensor_id, value, timestamp
+		 FROM sensor_data
+		 WHERE sensor_id = $1 AND timestamp >= $2 AND timestamp <= $3
+		 ORDER BY timestamp ASC`, sensorID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var data []model.SensorData
+	for rows.Next() {
+		var d model.SensorData
+		if err := rows.Scan(&d.ID, &d.SensorID, &d.Value, &d.Timestamp); err != nil {
+			return nil, err
+		}
+		data = append(data, d)
+	}
+	return data, rows.Err()
+}
+
+// CountSensorData 计数指定时间窗内的数据点数（用于完整度）
+func (s *Store) CountSensorData(ctx context.Context, sensorID int, since time.Time) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sensor_data WHERE sensor_id = $1 AND timestamp >= $2`,
+		sensorID, since).Scan(&count)
+	return count, err
+}
+
+// InsertHealthScore 一次事务插入 score + details + intermediate
+func (s *Store) InsertHealthScore(
+	ctx context.Context,
+	score *model.SectionHealthScore,
+	details []model.ScoreDetail,
+	intermediates []model.ScoreIntermediate,
+) (int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var scoreID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO section_health_scores
+			(section_id, total_score, grade, displacement_score, crack_score, strain_score,
+			 alert_dimension_score, trend_dimension_score, stability_dimension_score, completeness_dimension_score,
+			 position_type, sensitivity, trigger_type, calculated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		RETURNING id`,
+		score.SectionID, score.TotalScore, score.Grade,
+		score.DisplacementScore, score.CrackScore, score.StrainScore,
+		score.AlertDimensionScore, score.TrendDimensionScore,
+		score.StabilityDimensionScore, score.CompletenessDimensionScore,
+		score.PositionType, score.Sensitivity, score.TriggerType, score.CalculatedAt,
+	).Scan(&scoreID)
+	if err != nil {
+		return 0, err
+	}
+
+	for i := range details {
+		details[i].ScoreID = scoreID
+		details[i].CalculatedAt = score.CalculatedAt
+		_, err = tx.Exec(ctx, `
+			INSERT INTO section_health_score_details
+				(score_id, section_id, dimension, sub_dimension, raw_value, sub_score, weight, contribution, explanation, calculated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			scoreID, details[i].SectionID, details[i].Dimension, details[i].SubDimension,
+			details[i].RawValue, details[i].SubScore, details[i].Weight, details[i].Contribution,
+			details[i].Explanation, details[i].CalculatedAt,
+		)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	for i := range intermediates {
+		intermediates[i].ScoreID = scoreID
+		intermediates[i].CalculatedAt = score.CalculatedAt
+		var id int64
+		err = tx.QueryRow(ctx, `
+			INSERT INTO section_health_score_intermediate
+				(score_id, section_id, sensor_id, sensor_type, rate_24h, rate_7d, rate_30d,
+				 recent_alert_count, data_completeness, historical_variance, sensor_sub_score, inputs_json, calculated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			RETURNING id`,
+			scoreID, intermediates[i].SectionID, intermediates[i].SensorID,
+			intermediates[i].SensorType, intermediates[i].Rate24h, intermediates[i].Rate7d,
+			intermediates[i].Rate30d, intermediates[i].RecentAlertCount,
+			intermediates[i].DataCompleteness, intermediates[i].HistoricalVariance,
+			intermediates[i].SensorSubScore, intermediates[i].InputsJSON,
+			intermediates[i].CalculatedAt,
+		).Scan(&id)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return scoreID, nil
+}
+
+// GetLatestSectionHealthScore 获取某断面最新一次评分 + 明细 + 中间数据
+func (s *Store) GetLatestSectionHealthScore(ctx context.Context, sectionID int) (*model.SectionHealthScore, []model.ScoreDetail, []model.ScoreIntermediate, error) {
+	var score model.SectionHealthScore
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, section_id, total_score, grade, displacement_score, crack_score, strain_score,
+		       alert_dimension_score, trend_dimension_score, stability_dimension_score, completeness_dimension_score,
+		       position_type, sensitivity, trigger_type, calculated_at
+		FROM section_health_scores
+		WHERE section_id = $1
+		ORDER BY calculated_at DESC LIMIT 1`, sectionID).Scan(
+		&score.ID, &score.SectionID, &score.TotalScore, &score.Grade,
+		&score.DisplacementScore, &score.CrackScore, &score.StrainScore,
+		&score.AlertDimensionScore, &score.TrendDimensionScore,
+		&score.StabilityDimensionScore, &score.CompletenessDimensionScore,
+		&score.PositionType, &score.Sensitivity, &score.TriggerType, &score.CalculatedAt,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, score_id, section_id, dimension, sub_dimension, raw_value, sub_score, weight, contribution, explanation, calculated_at
+		FROM section_health_score_details
+		WHERE score_id = $1
+		ORDER BY dimension ASC`, score.ID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+	var details []model.ScoreDetail
+	for rows.Next() {
+		var d model.ScoreDetail
+		if err := rows.Scan(&d.ID, &d.ScoreID, &d.SectionID, &d.Dimension, &d.SubDimension,
+			&d.RawValue, &d.SubScore, &d.Weight, &d.Contribution, &d.Explanation, &d.CalculatedAt); err != nil {
+			return nil, nil, nil, err
+		}
+		details = append(details, d)
+	}
+
+	rows2, err := s.pool.Query(ctx, `
+		SELECT id, score_id, section_id, sensor_id, sensor_type, rate_24h, rate_7d, rate_30d,
+		       recent_alert_count, data_completeness, historical_variance, sensor_sub_score, inputs_json, calculated_at
+		FROM section_health_score_intermediate
+		WHERE score_id = $1
+		ORDER BY sensor_id ASC`, score.ID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows2.Close()
+	var inters []model.ScoreIntermediate
+	for rows2.Next() {
+		var it model.ScoreIntermediate
+		if err := rows2.Scan(&it.ID, &it.ScoreID, &it.SectionID, &it.SensorID, &it.SensorType,
+			&it.Rate24h, &it.Rate7d, &it.Rate30d, &it.RecentAlertCount,
+			&it.DataCompleteness, &it.HistoricalVariance, &it.SensorSubScore,
+			&it.InputsJSON, &it.CalculatedAt); err != nil {
+			return nil, nil, nil, err
+		}
+		inters = append(inters, it)
+	}
+	return &score, details, inters, nil
+}
+
+// GetHealthScoreHistoryAggregated 获取历史评分曲线（按 interval 聚合）
+func (s *Store) GetHealthScoreHistoryAggregated(ctx context.Context, sectionID int, start, end time.Time, interval string) ([]HistoryPoint, error) {
+	q := fmt.Sprintf(`
+		SELECT time_bucket('%s', calculated_at) AS bucket,
+		       AVG(total_score)::double precision AS avg_score,
+		       MIN(total_score)::double precision AS min_score,
+		       MAX(total_score)::double precision AS max_score,
+		       COUNT(*)::int AS samples
+		FROM section_health_scores
+		WHERE section_id = $1 AND calculated_at >= $2 AND calculated_at <= $3
+		GROUP BY bucket
+		ORDER BY bucket ASC`, interval)
+	rows, err := s.pool.Query(ctx, q, sectionID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pts []HistoryPoint
+	for rows.Next() {
+		var p HistoryPoint
+		if err := rows.Scan(&p.Bucket, &p.AvgScore, &p.MinScore, &p.MaxScore, &p.Samples); err != nil {
+			return nil, err
+		}
+		pts = append(pts, p)
+	}
+	return pts, rows.Err()
+}
+
+// GetSectionHealthRank 获取断面健康度排名（按线路）
+//
+// 设计要点：
+//   - latest CTE：取每个 section_id 最新一次评分
+//   - prev CTE：取每个 section_id 1 小时之前最近一次评分，用于计算趋势
+//   - prev_alerts CTE：取每个 section 最近 7 天内告警数（用于关联告警数展示）
+//   - 注意：DISTINCT ON 的 ORDER BY 必须以 DISTINCT ON 列开头，
+//     "ORDER BY section_id, calculated_at DESC" 即符合
+func (s *Store) GetSectionHealthRank(ctx context.Context, lineCode string) ([]RankItem, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH latest AS (
+			SELECT DISTINCT ON (section_id) section_id, total_score, grade,
+			       displacement_score, crack_score, strain_score,
+			       alert_dimension_score, trend_dimension_score, stability_dimension_score, completeness_dimension_score,
+			       position_type, sensitivity, trigger_type, calculated_at
+			FROM section_health_scores
+			ORDER BY section_id, calculated_at DESC
+		),
+		prev AS (
+			SELECT DISTINCT ON (section_id) section_id, total_score
+			FROM section_health_scores
+			WHERE calculated_at < NOW() - INTERVAL '1 hour'
+			ORDER BY section_id, calculated_at DESC
+		),
+		prev_alerts AS (
+			SELECT section_id, COUNT(*) AS cnt
+			FROM alerts
+			WHERE triggered_at >= NOW() - INTERVAL '7 days'
+			GROUP BY section_id
+		)
+		SELECT s.id, s.code, s.name, s.line_code,
+		       COALESCE(s.position_type, 'mid') AS position_type,
+		       l.total_score, l.grade,
+		       l.displacement_score, l.crack_score, l.strain_score,
+		       l.alert_dimension_score, l.trend_dimension_score, l.stability_dimension_score, l.completeness_dimension_score,
+		       l.sensitivity, l.trigger_type, l.calculated_at,
+		       COALESCE(pa.cnt, 0) AS recent_alert_count,
+		       COALESCE(p.total_score, 0) AS prev_score,
+		       (l.total_score - COALESCE(p.total_score, l.total_score)) AS score_trend
+		FROM sections s
+		JOIN latest l ON l.section_id = s.id
+		LEFT JOIN prev p ON p.section_id = s.id
+		LEFT JOIN prev_alerts pa ON pa.section_id = s.id
+		WHERE s.line_code = $1
+		ORDER BY l.total_score ASC`, lineCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RankItem
+	for rows.Next() {
+		var r RankItem
+		if err := rows.Scan(
+			&r.SectionID, &r.SectionCode, &r.SectionName, &r.LineCode,
+			&r.PositionType,
+			&r.TotalScore, &r.Grade,
+			&r.DisplacementScore, &r.CrackScore, &r.StrainScore,
+			&r.AlertDimensionScore, &r.TrendDimensionScore, &r.StabilityDimensionScore, &r.CompletenessDimensionScore,
+			&r.Sensitivity, &r.TriggerType, &r.CalculatedAt,
+			&r.RecentAlertCount, &r.PrevScore, &r.ScoreTrend,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, r)
+	}
+	return items, rows.Err()
 }

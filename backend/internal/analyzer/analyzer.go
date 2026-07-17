@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"time"
+	"tunnel-shm/internal/healthscore"
 	"tunnel-shm/internal/model"
 	"tunnel-shm/internal/store"
 	"tunnel-shm/internal/ws"
@@ -39,6 +40,7 @@ type Analyzer struct {
 	store     *store.Store
 	hub       *ws.Hub
 	threshold Threshold
+	health    *healthscore.Scheduler
 }
 
 // New 创建分析器
@@ -192,6 +194,12 @@ func (a *Analyzer) analyzeSensor(ctx context.Context, sensor *model.Sensor, sect
 		return false
 	}
 
+	// 告警插入成功后，异步触发该断面的健康度评分重算
+	// （节流由 scheduler 内部保证：同一断面 30s 内不重复重算）
+	if a.health != nil {
+		a.health.EnqueueRecompute(section.ID)
+	}
+
 	log.Printf("【分析-告警】%s", message)
 
 	// 通过WebSocket推送告警
@@ -221,4 +229,33 @@ func (a *Analyzer) AnalyzeSingleSensor(ctx context.Context, sensorID int) {
 	}
 
 	a.analyzeSensor(ctx, sensor, section)
+}
+
+// AnalyzeSectionByID 分析指定断面下的所有传感器（验收/调试用）
+//
+// 与 AnalyzeAllSensors 的区别：本方法只分析一个断面，速度快，
+// 用于验收脚本在数据上报后立刻检测告警，避免等待 5 分钟 cron。
+func (a *Analyzer) AnalyzeSectionByID(ctx context.Context, sectionID int) {
+	sec, err := a.store.GetSection(ctx, sectionID)
+	if err != nil {
+		log.Printf("【分析-错误】获取断面[%d]失败: %v", sectionID, err)
+		return
+	}
+	sensors, err := a.store.GetSensorsBySection(ctx, sectionID)
+	if err != nil {
+		log.Printf("【分析-错误】获取断面[%d]传感器失败: %v", sectionID, err)
+		return
+	}
+	cnt := 0
+	for i := range sensors {
+		if a.analyzeSensor(ctx, &sensors[i], sec) {
+			cnt++
+		}
+	}
+	log.Printf("【分析-断面】断面[%s] 分析完成，触发告警=%d", sec.Code, cnt)
+}
+
+// SetHealthScheduler 注入健康度调度器，告警插入后异步触发对应断面评分重算
+func (a *Analyzer) SetHealthScheduler(s *healthscore.Scheduler) {
+	a.health = s
 }

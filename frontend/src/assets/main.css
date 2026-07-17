@@ -459,3 +459,194 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ============================================================ */
+/* 健康度看板                                                  */
+/* ============================================================ */
+
+.health-dashboard-card {
+  background: var(--card-bg);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+.health-grade-summary {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.health-grade-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  text-align: center;
+  transition: all 0.2s;
+}
+
+.health-grade-pill .grade-label {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.health-grade-pill .grade-count {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.health-grade-pill .grade-bar {
+  width: 100%;
+  height: 4px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.health-grade-pill .grade-bar > span {
+  display: block;
+  height: 100%;
+}
+
+.health-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.health-table thead th {
+  background: #f5f7fa;
+  color: var(--text-secondary);
+  font-weight: 600;
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.health-table tbody td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.health-table tbody tr {
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.health-table tbody tr:hover {
+  background: #f5f7fa;
+}
+
+.health-table tbody tr.danger-row {
+  background: rgba(220, 38, 38, 0.04);
+}
+
+.health-table tbody tr.danger-row:hover {
+  background: rgba(220, 38, 38, 0.08);
+}
+
+.grade-tag {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.score-trend {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.score-trend.up {
+  color: #16a34a;
+  background: #dcfce7;
+}
+
+.score-trend.down {
+  color: #dc2626;
+  background: #fee2e2;
+}
+
+.score-trend.flat {
+  color: var(--text-secondary);
+  background: #f1f5f9;
+}
+
+.score-bar {
+  position: relative;
+  width: 100%;
+  height: 18px;
+  background: #f1f5f9;
+  border-radius: 9px;
+  overflow: hidden;
+  min-width: 80px;
+}
+
+.score-bar > .score-bar-fill {
+  height: 100%;
+  border-radius: 9px;
+  transition: width 0.4s ease;
+}
+
+.score-bar > .score-bar-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.health-line-tabs {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.health-line-tabs button {
+  padding: 4px 12px;
+  background: white;
+  border: none;
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  transition: all 0.15s;
+}
+
+.health-line-tabs button:last-child {
+  border-right: none;
+}
+
+.health-line-tabs button.active {
+  background: var(--primary);
+  color: white;
+}
+
+@media (max-width: 768px) {
+  .health-grade-summary {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}

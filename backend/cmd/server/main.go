@@ -12,6 +12,7 @@ import (
 	"tunnel-shm/internal/analyzer"
 	"tunnel-shm/internal/api"
 	"tunnel-shm/internal/collector"
+	"tunnel-shm/internal/healthscore"
 	"tunnel-shm/internal/store"
 	"tunnel-shm/internal/ws"
 
@@ -71,10 +72,14 @@ func main() {
 	// 初始化告警分析引擎
 	anal := analyzer.New(st, hub, nil)
 
-	// 初始化API处理器
-	handler := api.NewHandler(st)
+	// 初始化健康度评分调度器
+	healthSched := healthscore.NewScheduler(st)
+	healthSched.Start()
+	defer healthSched.Stop()
+	// 告警分析器在插入告警后异步触发对应断面重算
+	anal.SetHealthScheduler(healthSched)
 
-	// 设置Gin路由
+	// 初始化API处理器
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
@@ -92,7 +97,9 @@ func main() {
 	})
 
 	// 注册API路由
+	handler := api.NewHandler(st, r, anal)
 	handler.RegisterRoutes(r)
+	handler.RegisterHealthRoutes(healthSched)
 
 	// 数据采集接口
 	r.POST("/api/v1/collect", col.HandleCollectData)

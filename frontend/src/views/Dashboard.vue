@@ -31,6 +31,9 @@
       </div>
     </div>
 
+    <!-- 断面健康度看板（按线路展示所有断面的健康分值排名/趋势/告警数） -->
+    <HealthDashboard />
+
     <div class="card">
       <div class="card-header">
         <h2>最近告警</h2>
@@ -84,6 +87,7 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
 import { useMonitorStore } from '../stores/monitor'
+import HealthDashboard from './HealthDashboard.vue'
 
 const store = useMonitorStore()
 

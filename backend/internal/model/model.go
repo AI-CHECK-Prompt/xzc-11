@@ -32,14 +32,15 @@ const (
 
 // Section 监测断面
 type Section struct {
-	ID          int    `json:"id"`
-	Code        string `json:"code"`
-	Name        string `json:"name"`
-	LineCode    string `json:"line_code"`    // 线路编号
-	StationKm   int    `json:"station_km"`   // 里程位置(米)
-	Description string `json:"description"`
-	LocationLat float64 `json:"location_lat"`
-	LocationLng float64 `json:"location_lng"`
+	ID          int                 `json:"id"`
+	Code        string              `json:"code"`
+	Name        string              `json:"name"`
+	LineCode    string              `json:"line_code"`    // 线路编号
+	StationKm   int                 `json:"station_km"`   // 里程位置(米)
+	Description string              `json:"description"`
+	LocationLat float64             `json:"location_lat"`
+	LocationLng float64             `json:"location_lng"`
+	PositionType SectionPositionType `json:"position_type"` // 位置类型：station/mid/shaft/cross
 }
 
 // Sensor 传感器

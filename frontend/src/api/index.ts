@@ -78,3 +78,37 @@ export async function resolveAlert(alertId: number) {
   const { data } = await api.put(`/alerts/${alertId}/resolve`)
   return data
 }
+
+// ====== 健康度评分 ======
+
+// 获取断面健康度排名看板
+export async function getHealthRank(lineCode = '3'): Promise<HealthRankResponse> {
+  const { data } = await api.get('/health-dashboard/rank', { params: { line_code: lineCode } })
+  return data
+}
+
+// 获取指定断面的最新健康度评分（包含明细和复核中间数据）
+export async function getSectionHealth(sectionId: number): Promise<SectionHealthResponse> {
+  const { data } = await api.get(`/sections/${sectionId}/health`)
+  return data
+}
+
+// 获取指定断面的历史健康度曲线
+// interval 为 TimescaleDB time_bucket 字符串，如 '1 day' / '1 hour'
+export async function getSectionHealthHistory(
+  sectionId: number,
+  start: string,
+  end: string,
+  interval = '1 day'
+): Promise<HealthHistoryResponse> {
+  const { data } = await api.get(`/sections/${sectionId}/health/history`, {
+    params: { start, end, interval },
+  })
+  return data
+}
+
+// 手动触发某断面的健康度重算
+export async function recomputeSectionHealth(sectionId: number) {
+  const { data } = await api.post(`/sections/${sectionId}/health/recompute`)
+  return data
+}
