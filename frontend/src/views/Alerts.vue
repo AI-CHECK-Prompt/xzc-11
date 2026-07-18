@@ -15,7 +15,10 @@
       </div>
 
       <ul v-else class="alert-list">
-        <li v-for="alert in alerts" :key="alert.id" class="alert-item" :class="alert.level">
+        <li v-for="alert in alerts" :key="alert.id" class="alert-item" :class="alertLevelClass(alert.level)">
+          <span class="alert-level-badge" :class="'level-' + alertLevelClass(alert.level)">
+            {{ alertLevelLabel(alert.level) }}
+          </span>
           <div class="alert-content">
             <div class="alert-message">{{ alert.message }}</div>
             <div class="alert-meta">
@@ -45,14 +48,27 @@ import { storeToRefs } from 'pinia'
 import { useMonitorStore } from '../stores/monitor'
 import * as api from '../api'
 
+const ALERT_LEVEL_META: Record<Alert['level'], { label: string; cls: string }> = {
+  info:    { label: '提示',   cls: 'info' },
+  warning: { label: '警告',   cls: 'warning' },
+  danger:  { label: '严重',   cls: 'danger' },
+}
+
 const store = useMonitorStore()
 const { activeAlerts } = storeToRefs(store)
 
-// 复用全局 monitor store 中的活跃告警列表，自动接收 WS 推送的"自动恢复"事件
 const alerts = computed<Alert[]>(() => activeAlerts.value)
 
 const dangerCount = computed(() => alerts.value.filter(a => a.level === 'danger').length)
 const warningCount = computed(() => alerts.value.filter(a => a.level === 'warning').length)
+
+function alertLevelClass(level: Alert['level']) {
+  return ALERT_LEVEL_META[level]?.cls ?? 'info'
+}
+
+function alertLevelLabel(level: Alert['level']) {
+  return ALERT_LEVEL_META[level]?.label ?? '提示'
+}
 
 function formatTime(t: string) {
   return new Date(t).toLocaleString('zh-CN')
