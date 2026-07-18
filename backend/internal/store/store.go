@@ -113,13 +113,19 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		threshold DOUBLE PRECISION NOT NULL DEFAULT 0,
 		status VARCHAR(20) NOT NULL DEFAULT 'active',
 		triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		resolved_at TIMESTAMPTZ
+		resolved_at TIMESTAMPTZ,
+		-- 处理人：人工解决时为该告警的运维账号；
+		-- 系统自动恢复时记为 'system'，与人工处理区分以便按"处理人"统计运维工作量。
+		-- 缺省 NULL，兼容历史数据（无处理人记录视为系统或未知）。
+		handler VARCHAR(64)
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status);
 	CREATE INDEX IF NOT EXISTS idx_alerts_section ON alerts (section_id, triggered_at DESC);
 	-- 告警类型索引：用于存活感知 cron 判重（offline 类型 30 分钟内不重复）
 	CREATE INDEX IF NOT EXISTS idx_alerts_sensor_type_time ON alerts (sensor_id, type, triggered_at DESC);
+	-- 处理人索引：安全例会按"处理人"统计处置工作量（GROUP BY handler）
+	CREATE INDEX IF NOT EXISTS idx_alerts_handler ON alerts (handler) WHERE handler IS NOT NULL;
 
 	-- 数据保留策略：自动删除3年前的数据
 	SELECT add_retention_policy('sensor_data', INTERVAL '3 years', if_not_exists => TRUE);
@@ -219,6 +225,26 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		END $$;
 		CREATE INDEX IF NOT EXISTS idx_alerts_sensor_type_time
 			ON alerts (sensor_id, type, triggered_at DESC);
+	`)
+	if err != nil {
+		return err
+	}
+
+	// 兼容历史库：alerts 表缺 handler 列时补齐（人工解决告警时记录处理人）。
+	// handler 可空：NULL = 未知/历史；'system' = 系统自动恢复；其他 = 运维账号。
+	// VARCHAR(64) 与运维账号（中文姓名/工号/域账号）长度上限对齐。
+	_, err = s.pool.Exec(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_name = 'alerts' AND column_name = 'handler'
+			) THEN
+				ALTER TABLE alerts ADD COLUMN handler VARCHAR(64);
+			END IF;
+		END $$;
+		CREATE INDEX IF NOT EXISTS idx_alerts_handler
+			ON alerts (handler) WHERE handler IS NOT NULL;
 	`)
 	return err
 }
@@ -561,7 +587,7 @@ func (s *Store) InsertAlert(ctx context.Context, alert *model.Alert) error {
 // GetActiveAlerts 获取活跃告警
 func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at, resolved_at
+		`SELECT id, section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at, resolved_at, handler
 		 FROM alerts
 		 WHERE status = 'active'
 		 ORDER BY triggered_at DESC`)
@@ -574,7 +600,7 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 	for rows.Next() {
 		var a model.Alert
 		if err := rows.Scan(&a.ID, &a.SectionID, &a.SensorID, &a.Level, &a.Type, &a.Message,
-			&a.DeformationRate, &a.Threshold, &a.Status, &a.TriggeredAt, &a.ResolvedAt); err != nil {
+			&a.DeformationRate, &a.Threshold, &a.Status, &a.TriggeredAt, &a.ResolvedAt, &a.Handler); err != nil {
 			return nil, err
 		}
 		alerts = append(alerts, a)
@@ -586,7 +612,7 @@ func (s *Store) GetActiveAlerts(ctx context.Context) ([]model.Alert, error) {
 // status 传空字符串表示不过滤状态（兼容历史调用方）；
 // 传入 "active" / "resolved" 时按状态精确过滤，避免实时面板混入已解决告警。
 func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int, status string) ([]model.Alert, error) {
-	query := `SELECT id, section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at, resolved_at
+	query := `SELECT id, section_id, sensor_id, level, type, message, deformation_rate, threshold, status, triggered_at, resolved_at, handler
 		 FROM alerts
 		 WHERE section_id = $1`
 	args := []interface{}{sectionID}
@@ -610,7 +636,7 @@ func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int, 
 	for rows.Next() {
 		var a model.Alert
 		if err := rows.Scan(&a.ID, &a.SectionID, &a.SensorID, &a.Level, &a.Type, &a.Message,
-			&a.DeformationRate, &a.Threshold, &a.Status, &a.TriggeredAt, &a.ResolvedAt); err != nil {
+			&a.DeformationRate, &a.Threshold, &a.Status, &a.TriggeredAt, &a.ResolvedAt, &a.Handler); err != nil {
 			return nil, err
 		}
 		alerts = append(alerts, a)
@@ -619,10 +645,22 @@ func (s *Store) GetSectionAlerts(ctx context.Context, sectionID int, limit int, 
 }
 
 // ResolveAlert 解决告警
-func (s *Store) ResolveAlert(ctx context.Context, alertID int) error {
+//
+// handler 为该告警的处置人（运维账号 / system / unknown）。
+//   - 人工解决：handler 取自请求上下文（X-User 头）
+//   - 系统自动恢复：handler = model.AlertHandlerSystem
+//   - 兜底：handler = model.AlertHandlerUnknown
+//
+// 之所以把"未知"显式落地为字符串而不是保留 NULL，是为了按"处理人"统计
+// 时 NULL 和空字符串的语义混在一起会让 GROUP BY 出现难以解释的"空"组。
+func (s *Store) ResolveAlert(ctx context.Context, alertID int, handler string) error {
+	h := handler
+	if h == "" {
+		h = model.AlertHandlerUnknown
+	}
 	_, err := s.pool.Exec(ctx,
-		`UPDATE alerts SET status = 'resolved', resolved_at = NOW()
-		 WHERE id = $1`, alertID)
+		`UPDATE alerts SET status = 'resolved', resolved_at = NOW(), handler = $2
+		 WHERE id = $1`, alertID, h)
 	return err
 }
 
@@ -661,16 +699,25 @@ func (s *Store) CountActiveAlertsBySection(ctx context.Context) (map[int]int, er
 // 一批 active 告警一次性更新为 resolved。更新条件带 status='active' 兜底，
 // 避免重复关闭同一告警（若两次定时任务并发执行，后执行的将是 0 行更新）。
 //
+// handler 必须显式传入：通常为 model.AlertHandlerSystem（"system"），
+// 由调用方（analyzer.AutoResolveRecoveredAlerts）按职责传递，
+// store 层不做隐式兜底——自动恢复和人工解决是两条不同的处置路径，
+// 一旦混淆，"按处理人统计运维工作量"会混入大量非人工数据。
+//
 // 返回值：成功关闭的告警条数（用于上层统计）
-func (s *Store) AutoResolveAlerts(ctx context.Context, alertIDs []int) (int, error) {
+func (s *Store) AutoResolveAlerts(ctx context.Context, alertIDs []int, handler string) (int, error) {
 	if len(alertIDs) == 0 {
 		return 0, nil
 	}
+	h := handler
+	if h == "" {
+		h = model.AlertHandlerSystem
+	}
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE alerts
-		 SET status = 'resolved', resolved_at = NOW()
+		 SET status = 'resolved', resolved_at = NOW(), handler = $2
 		 WHERE status = 'active' AND id = ANY($1)`,
-		alertIDs)
+		alertIDs, h)
 	if err != nil {
 		return 0, err
 	}

@@ -54,13 +54,19 @@ CREATE TABLE IF NOT EXISTS alerts (
     threshold DOUBLE PRECISION NOT NULL DEFAULT 0,
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ
+    resolved_at TIMESTAMPTZ,
+    -- 处理人：人工解决时为该告警的运维账号；
+    -- 系统自动恢复时记为 'system'，与人工处理区分以便按"处理人"统计运维工作量。
+    -- 缺省 NULL，兼容历史数据（无处理人记录视为系统或未知）。
+    handler VARCHAR(64)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status);
 CREATE INDEX IF NOT EXISTS idx_alerts_section ON alerts (section_id, triggered_at DESC);
 -- 告警类型索引：用于存活感知 cron 判重（offline 类型 30 分钟内不重复）
 CREATE INDEX IF NOT EXISTS idx_alerts_sensor_type_time ON alerts (sensor_id, type, triggered_at DESC);
+-- 处理人索引：安全例会按"处理人"统计处置工作量（GROUP BY handler）
+CREATE INDEX IF NOT EXISTS idx_alerts_handler ON alerts (handler) WHERE handler IS NOT NULL;
 
 -- 数据保留策略：3年
 SELECT add_retention_policy('sensor_data', INTERVAL '3 years', if_not_exists => TRUE);

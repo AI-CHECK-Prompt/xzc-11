@@ -30,6 +30,42 @@ const (
 	AlertStatusResolved AlertStatus = "resolved"
 )
 
+// 告警处理人常量
+//
+// 用于在数据库 alerts.handler 字段中标识告警的处置来源，
+// 便于安全例会按"处理人"统计每位运维的告警处置工作量。
+//
+//   - AlertHandlerSystem : 系统自动恢复（cron 判定数据已恢复、无人介入）
+//   - AlertHandlerUnknown : 处理人未知（历史数据 / 接口调用未携带用户信息时兜底）
+const (
+	AlertHandlerSystem  = "system"
+	AlertHandlerUnknown = "unknown"
+)
+
+// ContextUserKey gin.Context 中存放当前用户名的 key
+//
+// 业务 handler 通过 model.GetCurrentUser(c) 读取当前操作者（运维账号）。
+// 写入由 main.go 的 userContextMiddleware 负责（从 X-User 头取值）。
+const ContextUserKey = "user"
+
+// GetCurrentUser 从 gin.Context 读取当前操作者账号
+//
+// 优先返回值：
+//   1. 中间件写入的 user 字段（来自 X-User / Authorization）
+//   2. 兜底返回 AlertHandlerUnknown
+//
+// 之所以用 model 包封装而不是散落在 handler 里直接 c.Get("user")，
+// 是为了：
+//   - 收敛 key 字符串，避免 key 拼写漂移
+//   - 默认值处理集中在一处，所有 handler 行为一致
+//   - 后续若切换到 SSO/JWT，只需修改本函数实现
+func GetCurrentUser(c interface{ GetString(string) string }) string {
+	if u := c.GetString(ContextUserKey); u != "" {
+		return u
+	}
+	return AlertHandlerUnknown
+}
+
 // AlertType 告警类型
 // 区分告警触发原因，便于前端分类展示与告警引擎覆盖范围分析。
 //   - AlertTypeRate  : 变形速率超阈值（原始告警类型，向后兼容缺省值）
@@ -89,6 +125,15 @@ type SensorDataBatch struct {
 }
 
 // Alert 告警记录
+//
+// Handler 字段记录告警的处置人：
+//   - 人工解决：填写具体运维账号（前端 X-User 头传入）
+//   - 系统自动恢复：固定为 model.AlertHandlerSystem ("system")
+//   - 兜底/历史：固定为 model.AlertHandlerUnknown ("unknown")
+//
+// 之所以在模型层定义常量，是为了在 store / api / analyzer 多个包内
+// 复用同一份字符串，避免出现 "system" / "System" / "auto" 等拼写漂移
+// 导致按"处理人"统计时同一类来源被拆成多组。
 type Alert struct {
 	ID           int           `json:"id"`
 	SectionID    int           `json:"section_id"`
@@ -101,6 +146,10 @@ type Alert struct {
 	Status       AlertStatus   `json:"status"`
 	TriggeredAt  time.Time     `json:"triggered_at"`
 	ResolvedAt   *time.Time    `json:"resolved_at"`
+	// Handler 处置人（运维账号 / system / unknown）。
+	// 使用指针以便在 JSON 序列化时区分"未填写（nil）"与"空字符串"——
+	// 前端展示时 nil 显示为 "-"，"" 视为异常数据，便于排查。
+	Handler      *string       `json:"handler,omitempty"`
 }
 
 // SensorLiveness 传感器存活/在线状态

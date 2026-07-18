@@ -48,6 +48,10 @@ interface Alert {
   status: 'active' | 'resolved'
   triggered_at: string
   resolved_at: string | null
+  // 处理人：人工解决时为运维账号；系统自动恢复时为 'system'；
+  // 历史数据未填写时为 null（前端展示为 "-"）。
+  // 用于安全例会按"处理人"统计运维告警处置工作量。
+  handler?: string | null
 }
 
 interface SectionRealtimeData {

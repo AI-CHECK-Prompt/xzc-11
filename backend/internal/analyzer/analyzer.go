@@ -560,7 +560,7 @@ func (a *Analyzer) AutoResolveRecoveredAlerts(ctx context.Context) (int, int, er
 		return len(activeAlerts), 0, nil
 	}
 
-	closed, err := a.store.AutoResolveAlerts(ctx, toResolve)
+	closed, err := a.store.AutoResolveAlerts(ctx, toResolve, model.AlertHandlerSystem)
 	if err != nil {
 		log.Printf("【分析-恢复-错误】批量关闭告警失败: %v", err)
 		return len(activeAlerts), 0, err

@@ -37,6 +37,13 @@
               <div class="alert-meta">
                 {{ formatTime(alert.triggered_at) }}
                 <span v-if="alert.status === 'resolved' && alert.resolved_at" class="resolved-tag">已解决 {{ formatTime(alert.resolved_at) }}</span>
+                <!-- 处理人：仅当告警为已解决时展示，
+                     - handler=null/'' 显示 "-"
+                     - handler='system' 显示"系统（自动恢复）"
+                     - 其他显示原账号 -->
+                <span v-if="alert.status === 'resolved'">
+                  | 处理人: <strong>{{ formatHandler(alert.handler) }}</strong>
+                </span>
               </div>
             </div>
           </li>
@@ -250,6 +257,16 @@ function getSensorStatusTooltip(sensorId: number) {
 
 function formatTime(t: string) {
   return new Date(t).toLocaleString('zh-CN')
+}
+
+// 与 Alerts.vue 保持一致的"处理人"展示规则：
+//   - null/undefined/'' -> '-'
+//   - 'system' -> '系统（自动恢复）'
+//   - 其他 -> 原样
+function formatHandler(h: string | null | undefined): string {
+  if (h == null || h === '') return '-'
+  if (h === 'system') return '系统（自动恢复）'
+  return h
 }
 
 async function selectSensor(sensor: Sensor) {

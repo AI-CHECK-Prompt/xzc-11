@@ -1,8 +1,33 @@
 import axios from 'axios'
+import { useUserStore } from '../stores/user'
 
 const api = axios.create({
   baseURL: '/api/v1',
   timeout: 10000,
+})
+
+// 请求拦截器：自动注入当前操作者到 X-User 头
+//
+// 修复"处理人字段为空"问题：之前 axios 只发 Content-Type，
+// 后端 middleware 拿不到当前运维账号，store.ResolveAlert 写入的
+// handler 只能是兜底 'unknown'。这里把 useUserStore 的 currentOperator
+// 拼到所有请求的 X-User 头里，让"按处理人统计"准确归到具体运维名下。
+//
+// 注意：拦截器在模块加载时注册一次，store 的引用是稳定的
+// （Pinia createPinia 后 useUserStore 始终返回同一实例），
+// 不会因为路由切换产生 stale 闭包。
+api.interceptors.request.use((config) => {
+  try {
+    const userStore = useUserStore()
+    const op = userStore.currentOperator?.trim()
+    if (op) {
+      config.headers = config.headers || {}
+      ;(config.headers as Record<string, string>)['X-User'] = op
+    }
+  } catch {
+    // Pinia 还未初始化时（理论上 main.ts 启动顺序保证不会发生）忽略
+  }
+  return config
 })
 
 // 获取仪表盘概览

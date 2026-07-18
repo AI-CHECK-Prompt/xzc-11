@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 	"tunnel-shm/internal/analyzer"
 	"tunnel-shm/internal/api"
 	"tunnel-shm/internal/collector"
 	"tunnel-shm/internal/healthscore"
+	"tunnel-shm/internal/model"
 	"tunnel-shm/internal/store"
 	"tunnel-shm/internal/ws"
 
@@ -88,13 +90,27 @@ func main() {
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// 处理人信息由前端 axios 通过 X-User 头传入，
+		// 必须在 CORS 的 Allow-Headers 中放行，否则浏览器预检请求会拒绝
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
 		}
 		c.Next()
 	})
+
+	// 用户上下文中间件：从 X-User 头提取当前运维账号，
+	// 写入 gin.Context（Key: "user"），供后续业务 handler 调用
+	// model.GetCurrentUser(c) 统一读取。
+	//
+	// 设计要点：
+	//   - X-User 缺失或为空时记为 AlertHandlerUnknown（"unknown"），
+	//     不再像历史那样"完全不留痕"，让"按处理人统计"时有兜底分组。
+	//   - 长度超 64 的账号会被截断并补日志，防御恶意客户端注入。
+	//   - 这里不做鉴权（鉴权由前置网关/SSO 负责），仅做"识别"。
+	//     后续若引入 SSO，回调/反向代理会在 X-User 写入已认证用户。
+	r.Use(userContextMiddleware())
 
 	// 注册API路由
 	handler := api.NewHandler(st, r, anal)
@@ -177,4 +193,38 @@ func getEnv(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// userContextMiddleware 从 HTTP 头提取当前用户，写入 gin.Context
+//
+// 优先顺序：
+//   1. X-User 请求头（前端 axios 显式传入）
+//   2. Authorization: Bearer <user>（兼容已有 token 场景，简单起见把整串作为 user）
+//   3. 都缺失 / 全空白：记为 model.AlertHandlerUnknown
+//
+// 长度限制与 DB 字段（VARCHAR(64)）保持一致，超长会被截断并打 WARN 日志，
+// 避免 SQL 报 "value too long for type character varying(64)"。
+//
+// 注意：此中间件只做"识别"，不参与鉴权。生产环境应在前置网关完成鉴权后
+// 再写入 X-User；中间件内的任何分支都允许请求继续到 c.Next()。
+func userContextMiddleware() gin.HandlerFunc {
+	const maxUserLen = 64
+	return func(c *gin.Context) {
+		user := strings.TrimSpace(c.GetHeader("X-User"))
+		if user == "" {
+			// 兜底：尝试从 Authorization 头解析（仅做演示用，生产请用 JWT/SSO）
+			if auth := c.GetHeader("Authorization"); auth != "" {
+				user = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+			}
+		}
+		if user == "" {
+			user = model.AlertHandlerUnknown
+		} else if len(user) > maxUserLen {
+			log.Printf("【用户-上下文-警告】X-User 长度超限（%d -> %d）：%s...",
+				len(user), maxUserLen, user[:maxUserLen])
+			user = user[:maxUserLen]
+		}
+		c.Set("user", user)
+		c.Next()
+	}
 }

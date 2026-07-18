@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -387,6 +388,19 @@ func (h *Handler) GetActiveAlerts(c *gin.Context) {
 }
 
 // ResolveAlert 解决告警
+//
+// 修复"处理人字段始终为空"问题：
+//   - 此前只调用 store.ResolveAlert(ctx, id)，handler 完全没有把
+//     "是谁在解决"这条信息往下传，导致 alerts.handler 永远是 NULL，
+//     安全例会无法按"处理人"统计运维告警处置工作量。
+//   - 修复后：handler 通过 model.GetCurrentUser(c) 拿到当前运维账号
+//     （由 main.go 的 userContextMiddleware 从 X-User 头提取），
+//     一并写入 store。store 层会把空字符串兜底为 AlertHandlerUnknown。
+//
+// 同时输出【告警-解决】操作日志（包含处理人、告警ID、客户端IP、UA），
+// 便于安全例会上做处置工时的二次核对（与 DB handler 字段对账）。
+//
+// 错误码：保持与原实现一致（400 非法 ID / 500 数据库错误）。
 func (h *Handler) ResolveAlert(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -394,11 +408,22 @@ func (h *Handler) ResolveAlert(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.ResolveAlert(c.Request.Context(), id); err != nil {
+	handler := model.GetCurrentUser(c)
+	start := time.Now()
+	// 操作日志前置打印：即使后续 DB 报错，也能留下"哪条告警被谁尝试处置"的痕迹
+	log.Printf("【告警-解决】处理人=%s 告警ID=%d 客户端IP=%s UA=%q",
+		handler, id, c.ClientIP(), c.Request.UserAgent())
+
+	if err := h.store.ResolveAlert(c.Request.Context(), id, handler); err != nil {
+		log.Printf("【告警-解决-错误】处理人=%s 告警ID=%d 错误=%v", handler, id, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "告警已解决"})
+	log.Printf("【告警-解决-成功】处理人=%s 告警ID=%d 耗时=%s", handler, id, time.Since(start))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "告警已解决",
+		"handler": handler,
+	})
 }
 
 // GetDashboardOverview 获取仪表盘概览
