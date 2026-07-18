@@ -31,8 +31,16 @@ func New(ctx context.Context, connStr string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析连接字符串失败: %w", err)
 	}
-	config.MaxConns = 50
+	// 连接池容量调整说明：
+	//   原 MaxConns=50 偏紧，cron 健康度评分全量跑起后（约 30 断面 × 串行查询），
+	//   加上采集模块高频写入与前端实时接口查询，会出现"评分执行时实时数据卡 1-2s"
+	//   ——本质是连接池被评分任务集中占用，新写入请求排队等待。
+	//   80 留给评分最高 32 并发 + 采集写入 16 + API/WS 16 + 余量 16。
+	//   30min 空闲回收避免僵尸连接长期占用，30min 生命周期避免数据库端超时。
+	config.MaxConns = 80
 	config.MinConns = 5
+	config.MaxConnIdleTime = 30 * time.Minute
+	config.MaxConnLifetime = 30 * time.Minute
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
